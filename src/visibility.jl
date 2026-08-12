@@ -182,7 +182,7 @@ end
 
 _area_scale(p::SurfacePatch) = p.area / p.geometric_area
 
-function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta)
+function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta, reporter=nothing)
     ns = length(mesh.boundary_segments)
     conductance = zeros(ns,ns)
     wedge = 2pi/ntheta
@@ -193,7 +193,7 @@ function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta)
         theta = mod(atan(p.center[3],p.center[2]),2pi)
         theta <= wedge + 100eps(Float64) && push!(receivers,ip)
     end
-    for ip in receivers
+    for (iteration,ip) in enumerate(receivers)
         p = patches[ip]
         for jp in eachindex(patches)
             ip == jp && continue
@@ -210,6 +210,7 @@ function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta)
             g > 0 || continue
             conductance[p.segment,q.segment] += g
         end
+        _status!(reporter,:boundary_exchange,iteration;total=length(receivers))
     end
     # The two independently integrated directions differ slightly at finite
     # quadrature order. Symmetrisation enforces reciprocity exactly.
@@ -219,16 +220,23 @@ function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta)
     # adjacent rings. Symmetric matrix balancing restores the exact enclosure
     # rule while retaining non-negativity, zeros, and discrete reciprocity.
     d = ones(length(areas))
-    for _ in 1:10_000
+    balance_iteration = 0
+    error = Inf
+    for iteration in 1:10_000
+        balance_iteration = iteration
         rows = d .* (conductance*d)
         any(rows .<= 0) && throw(ErrorException(
             "boundary quadrature has an isolated surface; increase azimuthal_divisions"))
         error = maximum(abs.(rows ./ areas .- 1))
+        _status!(reporter,:exchange_balance,iteration;
+                 exchange_closure=error)
         error < 1e-12 && break
         d .*= sqrt.(areas ./ rows)
     end
     conductance .*= d .* transpose(d)
     H = conductance ./ areas # row i divided by receiving area i
     closure = maximum(abs.(sum(conductance;dims=1)[:] ./ areas .- 1))
+    _status!(reporter,:exchange_balance,balance_iteration;
+             exchange_closure=closure,force=true)
     H, closure
 end

@@ -44,16 +44,18 @@ function _solve_radiosity(mesh::RZMesh, H, gas::Gas, tolerance)
     q, residual
 end
 
-function _cell_fields(mesh::RZMesh, patches, bvh, q, gas, tol)
+function _evaluate_fields(mesh::RZMesh, sample_points, patches, bvh, q, gas, tol;
+                          reporter=nothing, closure=NaN, radiosity=NaN,
+                          phase=:field_reconstruction)
     labels = sort(unique(s.label for s in mesh.boundary_segments))
-    nc = length(mesh.cells)
-    direct = Dict(label => zeros(nc) for label in labels)
-    contribution = Dict(label => zeros(nc) for label in labels)
-    momentum = zeros(3,nc)
-    density = zeros(nc)
+    count = length(sample_points)
+    direct = Dict(label => zeros(count) for label in labels)
+    contribution = Dict(label => zeros(count) for label in labels)
+    momentum = zeros(3,count)
+    density = zeros(count)
     speeds = [mean_molecular_speed(gas,_temperature(s.condition)) for s in mesh.boundary_segments]
 
-    for (ic,rz) in pairs(mesh.centers)
+    for (ic,rz) in pairs(sample_points)
         point = (rz[1],rz[2],0.0)
         for (ip,patch) in pairs(patches)
             ray = _vsub(point,patch.center)
@@ -84,8 +86,18 @@ function _cell_fields(mesh::RZMesh, patches, bvh, q, gas, tol)
             momentum[:,ic] .= 0
         end
         momentum[3,ic] = 0.0 # exact by axisymmetry; removes finite-wedge roundoff
+        _status!(reporter,phase,ic;total=count,
+                 exchange_closure=closure,radiosity=radiosity)
     end
+    _status!(reporter,phase,count;total=count,exchange_closure=closure,
+             radiosity=radiosity,force=true)
     labels,direct,contribution,density,momentum
+end
+
+function _cell_fields(mesh::RZMesh, patches, bvh, q, gas, tol,
+                      reporter=nothing, closure=NaN, radiosity=NaN)
+    _evaluate_fields(mesh,mesh.centers,patches,bvh,q,gas,tol;
+                     reporter,closure,radiosity)
 end
 
 function _particle_balance(mesh,H,q)
@@ -97,24 +109,40 @@ function _particle_balance(mesh,H,q)
 end
 
 """
-    solve(geometry, boundaries, gas; options=SolverOptions()) -> FlowResult
+    solve(geometry, boundaries, gas; options=SolverOptions(),
+          status_interval=0, status_io=stdout) -> FlowResult
 
 Solve steady, single-species, collisionless free-molecular flow in an
 axisymmetric domain. Boundary labels in `geometry` map to `Inflow`,
 `BackPressure`, `DiffuseWall`, or `Axis` values in `boundaries`.
 """
 function solve(geometry::AxisymmetricGeometry, boundaries, gas::Gas;
-               options::SolverOptions=SolverOptions())
+               options::SolverOptions=SolverOptions(),
+               status_interval::Real=0.0, status_io::IO=stdout,
+               status_reporter::Union{Nothing,StatusReporter}=nothing)
+    reporter = status_reporter === nothing && status_interval > 0 ?
+               StatusReporter(status_interval,status_io) : status_reporter
+    status_interval >= 0 || throw(ArgumentError("status_interval must be nonnegative"))
+    _status!(reporter,:mesh,0;force=true)
     mesh = _make_mesh(geometry,boundaries,options)
+    _status!(reporter,:mesh,length(mesh.cells);total=length(mesh.cells),force=true)
+    _status!(reporter,:surface_quadrature,0;force=true)
     patches = _revolve_segments(mesh.boundary_segments,options.azimuthal_divisions)
     bvh = _build_bvh(patches)
+    _status!(reporter,:surface_quadrature,length(patches);total=length(patches),force=true)
     scale = maximum(abs,Iterators.flatten(geometry.points);init=1.0)
     tol = options.visibility_tolerance * max(scale,1.0)
-    H, closure = _boundary_exchange(mesh,patches,bvh,tol,options.azimuthal_divisions)
+    H, closure = _boundary_exchange(mesh,patches,bvh,tol,
+                                    options.azimuthal_divisions,reporter)
+    _status!(reporter,:radiosity,0;exchange_closure=closure,force=true)
     q, residual = _solve_radiosity(mesh,H,gas,options.radiosity_tolerance)
+    _status!(reporter,:radiosity,1;total=1,exchange_closure=closure,
+             radiosity=residual,force=true)
     labels,direct,contributions,density,velocity =
-        _cell_fields(mesh,patches,bvh,q,gas,tol)
+        _cell_fields(mesh,patches,bvh,q,gas,tol,reporter,closure,residual)
     balance = _particle_balance(mesh,H,q)
+    _status!(reporter,:complete,1;total=1,exchange_closure=closure,
+             radiosity=residual,particle_balance=balance,force=true)
     FlowResult(mesh,labels,direct,contributions,density,velocity,q,
-               residual,balance,closure)
+               residual,balance,closure,gas,options)
 end

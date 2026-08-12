@@ -91,6 +91,124 @@ Base.@kwdef struct SolverOptions
     max_mesh_points::Int = 200_000
 end
 
+const EXTRACTION_FIELDS = (:number_density, :velocity, :view_factors,
+                           :density_contributions)
+
+"""
+A uniformly sampled straight or piecewise-linear path in the R-Z plane.
+
+Exactly one of `num_points` and `spacing` must be supplied. `method` is
+`:direct` or `:cell`; `outside_domain` is `:keep`, `:drop`, or `:error`.
+"""
+struct ExtractionLine
+    name::String
+    points::Vector{NTuple{2,Float64}}
+    num_points::Union{Nothing,Int}
+    spacing::Union{Nothing,Float64}
+    method::Symbol
+    outside_domain::Symbol
+    fields::Vector{Symbol}
+    filename::String
+    function ExtractionLine(name::AbstractString, points;
+                            num_points::Union{Nothing,Integer}=nothing,
+                            spacing::Union{Nothing,Real}=nothing,
+                            method::Union{Symbol,AbstractString}=:direct,
+                            outside_domain::Union{Symbol,AbstractString}=:keep,
+                            fields=EXTRACTION_FIELDS,
+                            filename::Union{Nothing,AbstractString}=nothing)
+        clean_name = strip(String(name))
+        isempty(clean_name) && throw(ArgumentError("extraction-line name may not be empty"))
+        pts = NTuple{2,Float64}[(Float64(p[1]),Float64(p[2])) for p in points]
+        length(pts) >= 2 || throw(ArgumentError("extraction line needs at least two control points"))
+        all(p -> all(isfinite,p),pts) ||
+            throw(ArgumentError("extraction-line coordinates must be finite"))
+        all(p -> p[2] >= 0,pts) ||
+            throw(ArgumentError("extraction-line radius r must be nonnegative"))
+        all(i -> pts[i] != pts[i+1],1:length(pts)-1) ||
+            throw(ArgumentError("adjacent extraction-line control points must differ"))
+        (num_points === nothing) != (spacing === nothing) ||
+            throw(ArgumentError("extraction line requires exactly one of num_points or spacing"))
+        count = num_points === nothing ? nothing : Int(num_points)
+        count === nothing || count >= 2 ||
+            throw(ArgumentError("extraction-line num_points must be at least 2"))
+        step = spacing === nothing ? nothing : Float64(spacing)
+        step === nothing || (isfinite(step) && step > 0) ||
+            throw(ArgumentError("extraction-line spacing must be finite and positive"))
+        method_symbol = Symbol(lowercase(String(method)))
+        method_symbol in (:direct,:cell) ||
+            throw(ArgumentError("extraction-line method must be `direct` or `cell`"))
+        outside_symbol = Symbol(lowercase(String(outside_domain)))
+        outside_symbol in (:keep,:drop,:error) || throw(ArgumentError(
+            "extraction-line outside_domain must be `keep`, `drop`, or `error`"))
+        selected = Symbol[Symbol(lowercase(String(field))) for field in fields]
+        isempty(selected) && throw(ArgumentError("extraction-line fields may not be empty"))
+        length(unique(selected)) == length(selected) ||
+            throw(ArgumentError("extraction-line fields may not contain duplicates"))
+        unknown = setdiff(selected,collect(EXTRACTION_FIELDS))
+        isempty(unknown) || throw(ArgumentError(
+            "unknown extraction fields: $(join(string.(unknown), ", "))"))
+        filename_stem = strip(replace(lowercase(clean_name),
+                                      r"[^a-z0-9_-]+" => "_"),'_')
+        isempty(filename_stem) && (filename_stem = "extraction")
+        default_filename = filename_stem * ".csv"
+        output = filename === nothing ? default_filename : String(filename)
+        isempty(strip(output)) && throw(ArgumentError("extraction-line filename may not be empty"))
+        new(clean_name,pts,count,step,method_symbol,outside_symbol,selected,output)
+    end
+end
+
+mutable struct StatusReporter
+    interval::Float64
+    io::IO
+    started::Float64
+    last_printed::Float64
+    header_printed::Bool
+end
+
+function StatusReporter(interval::Real, io::IO)
+    interval >= 0 || throw(ArgumentError("status_interval must be nonnegative"))
+    now = time()
+    StatusReporter(Float64(interval),io,now,now-Float64(interval),false)
+end
+
+function _residual_text(value)
+    isfinite(value) ? @sprintf("%.3e",value) : "-"
+end
+
+const _STATUS_PHASE_NAMES = Dict(
+    :mesh => "mesh",
+    :surface_quadrature => "surface",
+    :boundary_exchange => "exchange",
+    :exchange_balance => "balance",
+    :radiosity => "radiosity",
+    :field_reconstruction => "fields",
+    :line_extraction => "extract",
+    :complete => "complete")
+
+function _status!(reporter::Union{Nothing,StatusReporter}, phase::Symbol,
+                  iteration::Integer; total::Integer=0,
+                  exchange_closure::Real=NaN, radiosity::Real=NaN,
+                  particle_balance::Real=NaN, force::Bool=false)
+    reporter === nothing && return
+    now = time()
+    (force || now-reporter.last_printed >= reporter.interval) || return
+    progress = total > 0 ? "$(iteration)/$(total)" : string(iteration)
+    if !reporter.header_printed
+        @printf(reporter.io,"%-10s %11s %10s %11s %11s %11s\n",
+                "phase","iteration","elapsed(s)","closure","radiosity","balance")
+        @printf(reporter.io,"%-10s %11s %10s %11s %11s %11s\n",
+                "----------","-----------","----------","-----------","-----------","-----------")
+        reporter.header_printed = true
+    end
+    @printf(reporter.io,
+        "%-10s %11s %10.2f %11s %11s %11s\n",
+        get(_STATUS_PHASE_NAMES,phase,String(phase)),progress,now-reporter.started,
+        _residual_text(exchange_closure),_residual_text(radiosity),
+        _residual_text(particle_balance))
+    flush(reporter.io)
+    reporter.last_printed = now
+end
+
 struct BoundarySegment
     a::NTuple{2,Float64}
     b::NTuple{2,Float64}
@@ -119,6 +237,8 @@ struct FlowResult
     radiosity_residual::Float64
     particle_balance_residual::Float64
     exchange_closure_error::Float64
+    gas::Gas
+    options::SolverOptions
 end
 
 number_density(result::FlowResult) = result.density

@@ -24,6 +24,18 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 julia --project=. bin/free_molecular_flow.jl examples/hall_channel.toml
 ```
 
+Longer cases can print periodic progress and residuals by passing an interval
+in seconds:
+
+```sh
+julia --project=. bin/free_molecular_flow.jl --status-interval 5 examples/spt100.toml
+```
+
+The compact status table reports the active phase, phase-local
+iteration/progress, total elapsed time, and every residual available at that
+point. The default interval is zero, which disables status output. The library equivalents are
+`solve(...; status_interval=5)` and `run_config(...; status_interval=5)`.
+
 The example writes `examples/hall_channel.vtu`, readable by ParaView. Run the
 test suite with:
 
@@ -109,6 +121,43 @@ The `.vtu` file contains triangle cell data:
 
 Field-data scalars record the three solver diagnostics. Labels are lowercased
 and sanitized for use as VTK array names.
+
+## Line extraction
+
+Add one or more array-of-table entries to a TOML case. Two control points make
+a straight line; additional points make a polyline:
+
+```toml
+[[extraction_lines]]
+name = "plume_centerline"
+points = [
+  { z = 0.025, r = 0.0 },
+  { z = 0.100, r = 0.0 },
+]
+num_points = 101
+method = "direct"
+outside_domain = "keep"
+fields = ["number_density", "velocity", "view_factors", "density_contributions"]
+filename = "spt100_centerline.csv"
+```
+
+Sampling is uniform in cumulative path distance and includes both endpoints.
+Specify exactly one of `num_points` or `spacing` (metres). With spacing, a final
+short interval is added as needed so the last control point is always included.
+
+`method = "direct"` (the default) evaluates the view-factor moments at the exact
+sample coordinates. `method = "cell"` is faster and copies the containing
+triangle's cell-centered result. `outside_domain` may be `"keep"`, `"drop"`, or
+`"error"`; kept outside points have `cell_index=0` and empty solution fields.
+
+The CSV always includes sample number, polyline segment, cumulative fraction
+and distance (metres), `(z,r)` coordinates (metres), domain membership, and
+containing cell index. The available solution-field groups are `number_density`, `velocity`, `view_factors`,
+and `density_contributions`. Omitting `fields` writes all groups. Omitting
+`filename` derives `<name>.csv`; otherwise the path is resolved relative to the
+TOML file. Multiple `[[extraction_lines]]` blocks produce multiple CSV files.
+When CLI status output is enabled, direct extraction progress appears as an
+`extract` phase in the same status table.
 
 ## Scope and physical assumptions
 

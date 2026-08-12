@@ -25,9 +25,10 @@ end
 @testset "uniform reservoir equilibrium" begin
     geometry = box_geometry(["axis","reservoir","reservoir","reservoir"])
     pressure, temperature = 0.01, 300.0
+    status = IOBuffer()
     result = solve(geometry,
         Dict("axis"=>Axis(),"reservoir"=>BackPressure(pressure,temperature)),
-        XENON;options=QUICK)
+        XENON;options=QUICK,status_interval=1e9,status_io=status)
     exact_density = pressure/(KB*temperature)
     @test all(isfinite,result.density)
     @test maximum(abs.(result.density ./ exact_density .- 1)) < 0.08
@@ -35,6 +36,15 @@ end
     @test result.particle_balance_residual < 1e-9
     @test result.exchange_closure_error < 1e-9
     @test maximum(abs.(result.direct_view_factors["reservoir"] .- 1)) < 0.08
+    status_text = String(take!(status))
+    @test occursin("phase",status_text)
+    @test occursin("iteration",status_text)
+    @test occursin("elapsed(s)",status_text)
+    @test occursin("mesh",status_text)
+    @test occursin("complete",status_text)
+    @test_throws ArgumentError solve(geometry,
+        Dict("axis"=>Axis(),"reservoir"=>BackPressure(pressure,temperature)),
+        XENON;options=QUICK,status_interval=-1)
 end
 
 @testset "inflow, diffuse wall, and linearity" begin
@@ -73,7 +83,69 @@ end
         @test occursin("velocity",xml)
         @test occursin("direct_view_factor_reservoir",xml)
         @test occursin("density_from_reservoir",xml)
+
+        line = ExtractionLine("crossing",
+            [(-0.01,0.025),(0.11,0.025)];num_points=5,method=:cell,
+            outside_domain=:keep,fields=[:number_density,:velocity],
+            filename="line.csv")
+        csv_path = write_extraction_line(joinpath(dir,line.filename),result,line)
+        rows = readlines(csv_path)
+        @test length(rows) == 6
+        @test startswith(rows[1],"sample,path_segment,fraction,distance,z,r,inside_domain,cell_index,number_density")
+        @test split(rows[2],',')[7:8] == ["false","0"]
+        @test split(rows[4],',')[7] == "true"
+        @test split(rows[6],',')[7:8] == ["false","0"]
+
+        dropped = ExtractionLine("drop outside",
+            [(-0.01,0.025),(0.11,0.025)];num_points=5,method=:cell,
+            outside_domain=:drop,fields=[:number_density])
+        dropped_rows = readlines(write_extraction_line(
+            joinpath(dir,dropped.filename),result,dropped))
+        @test length(dropped_rows) == 4 # header plus three interior samples
+
+        strict = ExtractionLine("strict",
+            [(-0.01,0.025),(0.05,0.025)];num_points=3,method=:cell,
+            outside_domain=:error,fields=[:number_density])
+        @test_throws ArgumentError write_extraction_line(
+            joinpath(dir,strict.filename),result,strict)
+
+        direct_line = ExtractionLine("direct profile",
+            [(0.01,0.025),(0.09,0.025)];spacing=0.02,
+            fields=[:number_density],outside_domain=:error)
+        direct_path = write_extraction_line(joinpath(dir,direct_line.filename),
+                                            result,direct_line)
+        direct_rows = readlines(direct_path)
+        @test length(direct_rows) == 6
+        @test direct_rows[1] == "sample,path_segment,fraction,distance,z,r,inside_domain,cell_index,number_density"
+        @test all(row -> split(row,',')[7] == "true",direct_rows[2:end])
+
+        polyline = ExtractionLine("bent path",
+            [(0.01,0.01),(0.09,0.01),(0.09,0.04)];spacing=0.04,
+            method=:cell,fields=[:number_density])
+        polyline_rows = readlines(write_extraction_line(
+            joinpath(dir,polyline.filename),result,polyline))
+        @test length(polyline_rows) == 5
+        @test split(polyline_rows[4],',')[2] == "2"
     end
+end
+
+@testset "line configuration" begin
+    config = load_config(joinpath(@__DIR__,"..","examples","spt100.toml"))
+    @test length(config.extraction_lines) == 1
+    line = only(config.extraction_lines)
+    @test line.name == "plume_centerline"
+    @test line.points == [(0.025,0.0),(0.1,0.0)]
+    @test line.num_points == 101
+    @test line.spacing === nothing
+    @test line.method == :direct
+    @test line.outside_domain == :keep
+    @test line.filename == "spt100_centerline.csv"
+    @test_throws ArgumentError ExtractionLine("bad",[(0,0),(1,1)];num_points=1)
+    @test_throws ArgumentError ExtractionLine("bad",[(0,0),(1,1)];
+                                              num_points=2,spacing=0.1)
+    @test_throws ArgumentError ExtractionLine("bad",[(0,0),(1,1)];
+                                              spacing=0.1,method=:unknown)
+    @test_throws ArgumentError ExtractionLine("bad",[(0,-1),(1,1)];spacing=0.1)
 end
 
 @testset "boundary errors" begin

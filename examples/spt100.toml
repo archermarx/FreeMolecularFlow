@@ -1,0 +1,73 @@
+[gas]
+# Xenon propellant.
+molecular_mass_amu = 131.293
+
+[geometry]
+# SPT-100 meridional gas domain in [z, r] metres. The annular channel runs
+# from z=0 to z=0.025 m between r=0.035 and 0.050 m. The solid thruster face
+# and outer body extend to r=0.080 m; the background domain ends at z=r=0.1 m.
+points = [
+  [0.000, 0.035],
+  [0.000, 0.050],
+  [0.025, 0.050],
+  [0.025, 0.080],
+  [0.000, 0.080],
+  [0.000, 0.100],
+  [0.100, 0.100],
+  [0.100, 0.000],
+  [0.025, 0.000],
+  [0.025, 0.035],
+]
+edge_labels = [
+  "anode",
+  "wall",
+  "wall",
+  "wall",
+  "background",
+  "background",
+  "background",
+  "axis",
+  "wall",
+  "wall",
+]
+
+[boundaries.anode]
+type = "inflow"
+mass_flow_rate = 5.0e-6       # 5 mg/s
+temperature = 773.15          # 500 degC
+
+[boundaries.wall]
+type = "diffuse_wall"
+temperature = 773.15          # 500 degC
+
+[boundaries.background]
+type = "back_pressure"
+pressure = 6.6661184e-4       # 5e-6 Torr in Pa
+temperature = 100.0
+
+[boundaries.axis]
+type = "axis"
+
+[solver]
+max_area = 1.0e-6
+min_angle = 20.0
+azimuthal_divisions = 64
+radiosity_tolerance = 1.0e-10
+visibility_tolerance = 1.0e-10
+max_mesh_points = 200000
+
+[output]
+path = "spt100.vtu"
+
+[[extraction_lines]]
+# Axial centerline through the plume, including the exit-plane point.
+name = "plume_centerline"
+points = [
+  { z = 0.025, r = 0.0 },
+  { z = 0.100, r = 0.0 },
+]
+num_points = 101
+method = "direct"
+outside_domain = "keep"
+fields = ["number_density", "velocity", "view_factors", "density_contributions"]
+filename = "spt100_centerline.csv"

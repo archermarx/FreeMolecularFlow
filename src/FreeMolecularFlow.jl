@@ -8,7 +8,8 @@ using WriteVTK
 
 export AxisymmetricGeometry, Gas, Inflow, BackPressure, DiffuseWall, Axis,
        SolverOptions, FlowResult, solve, write_vtk, load_config, run_config,
-       number_density, mean_molecular_speed
+       ExtractionLine, write_extraction_line, number_density,
+       mean_molecular_speed
 
 include("types.jl")
 include("geometry.jl")
