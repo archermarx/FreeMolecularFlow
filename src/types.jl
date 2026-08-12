@@ -1,9 +1,16 @@
+# Exact SI value of k_B and the CODATA atomic-mass conversion used by Gas.
 const BOLTZMANN = 1.380649e-23
 const ATOMIC_MASS = 1.66053906660e-27
 
 abstract type BoundaryCondition end
 
-"""A prescribed cosine-law inflow with total mass flow rate (kg/s)."""
+"""
+A prescribed cosine-law inflow with total mass flow rate (kg/s).
+
+All refined boundary segments sharing the same label divide this total flow in
+proportion to their revolved area; `mass_flow_rate` is therefore not a local
+flux density.
+"""
 struct Inflow <: BoundaryCondition
     mass_flow_rate::Float64
     temperature::Float64
@@ -14,7 +21,11 @@ struct Inflow <: BoundaryCondition
     end
 end
 
-"""An open boundary connected to a stationary reservoir at pressure (Pa) and temperature (K)."""
+"""
+An open boundary connected to a stationary reservoir at pressure (Pa) and
+temperature (K). Molecules may leave freely, while the reservoir supplies the
+incoming half of an isotropic Maxwellian. Set pressure to zero for vacuum.
+"""
 struct BackPressure <: BoundaryCondition
     pressure::Float64
     temperature::Float64
@@ -25,7 +36,13 @@ struct BackPressure <: BoundaryCondition
     end
 end
 
-"""A fully accommodating, cosine-law diffuse wall."""
+"""
+A fully accommodating, cosine-law diffuse wall.
+
+Incident molecules lose memory of their incoming velocity and are re-emitted
+at the wall temperature. The radiosity solve enforces zero net particle loss at
+this boundary.
+"""
 struct DiffuseWall <: BoundaryCondition
     temperature::Float64
     function DiffuseWall(temperature::Real)
@@ -34,7 +51,10 @@ struct DiffuseWall <: BoundaryCondition
     end
 end
 
-"""A zero-area symmetry-axis edge. Axis edges must lie at r = 0."""
+"""
+A zero-area symmetry-axis edge. Axis edges must lie at `r = 0`; they close the
+R-Z polygon but do not create a physical surface when revolved.
+"""
 struct Axis <: BoundaryCondition end
 
 """A single-species neutral gas. `molecular_mass` is in kg per molecule."""
@@ -83,12 +103,12 @@ struct AxisymmetricGeometry
 end
 
 Base.@kwdef struct SolverOptions
-    max_area::Float64 = 0.0
-    min_angle::Float64 = 20.0
-    azimuthal_divisions::Int = 64
-    radiosity_tolerance::Float64 = 1e-10
-    visibility_tolerance::Float64 = 1e-10
-    max_mesh_points::Int = 200_000
+    max_area::Float64 = 0.0             # Maximum R-Z triangle area [m²]; 0 is automatic.
+    min_angle::Float64 = 20.0           # Delaunay mesh-quality target [degrees].
+    azimuthal_divisions::Int = 64       # Wedges used to revolve every boundary segment.
+    radiosity_tolerance::Float64 = 1e-10 # Linear-solve conditioning/residual tolerance.
+    visibility_tolerance::Float64 = 1e-10 # Relative ray-intersection tolerance.
+    max_mesh_points::Int = 200_000      # Guard against runaway mesh refinement.
 end
 
 const EXTRACTION_FIELDS = (:number_density, :velocity, :view_factors,
@@ -168,6 +188,7 @@ end
 function StatusReporter(interval::Real, io::IO)
     interval >= 0 || throw(ArgumentError("status_interval must be nonnegative"))
     now = time()
+    # Backdate last_printed so the initial phase row is emitted immediately.
     StatusReporter(Float64(interval),io,now,now-Float64(interval),false)
 end
 
@@ -191,6 +212,8 @@ function _status!(reporter::Union{Nothing,StatusReporter}, phase::Symbol,
                   particle_balance::Real=NaN, force::Bool=false)
     reporter === nothing && return
     now = time()
+    # `force` is used at phase boundaries so even short calculations document
+    # their progression; loop updates remain rate-limited by wall-clock time.
     (force || now-reporter.last_printed >= reporter.interval) || return
     progress = total > 0 ? "$(iteration)/$(total)" : string(iteration)
     if !reporter.header_printed
@@ -210,6 +233,8 @@ function _status!(reporter::Union{Nothing,StatusReporter}, phase::Symbol,
 end
 
 struct BoundarySegment
+    # Endpoints follow the normalized counter-clockwise polygon direction. This
+    # orientation makes the gas-side normal unambiguous during revolution.
     a::NTuple{2,Float64}
     b::NTuple{2,Float64}
     label::String
@@ -221,11 +246,19 @@ struct RZMesh
     points::Vector{NTuple{2,Float64}}
     cells::Vector{NTuple{3,Int}}
     centers::Vector{NTuple{2,Float64}}
+    # Axisymmetric cell volume obtained by revolving each triangle around r=0.
     volumes::Vector{Float64}
     boundary_segments::Vector{BoundarySegment}
 end
 
-"""Results of a steady free-molecular calculation."""
+"""
+Results of a steady free-molecular calculation.
+
+All spatial arrays are cell-centered. Per-label dictionaries separate direct
+geometric visibility from the actual density contribution after diffuse-wall
+recycling. The saved gas and options allow exact direct evaluation later when
+writing extraction lines.
+"""
 struct FlowResult
     mesh::RZMesh
     labels::Vector{String}
@@ -244,11 +277,13 @@ end
 number_density(result::FlowResult) = result.density
 
 function _signed_area(p)
+    # Shoelace sign establishes polygon orientation in the (z,r) plane.
     0.5 * sum(p[i][1] * p[mod1(i+1, length(p))][2] -
               p[mod1(i+1, length(p))][1] * p[i][2] for i in eachindex(p))
 end
 
 function _orient(a, b, c)
+    # Twice the signed area of triangle (a,b,c); positive means a left turn.
     (b[1]-a[1]) * (c[2]-a[2]) - (b[2]-a[2]) * (c[1]-a[1])
 end
 
@@ -259,6 +294,9 @@ function _on_segment(a, b, p; atol=1e-13)
 end
 
 function _segments_intersect(a,b,c,d)
+    # Proper crossings are detected by opposing orientations; the final checks
+    # include touching/collinear intersections, which are invalid for this
+    # solver's single simple polygon.
     o1, o2, o3, o4 = _orient(a,b,c), _orient(a,b,d), _orient(c,d,a), _orient(c,d,b)
     ((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) &&
         ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0)) && return true

@@ -8,6 +8,8 @@ function usage(io=stdout)
 end
 
 function parse_args(args)
+    # Keep argument parsing dependency-free: the executable intentionally has
+    # only one optional numeric flag and one positional TOML path.
     interval = 0.0
     config = nothing
     i = 1

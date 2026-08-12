@@ -60,11 +60,11 @@ max_mesh_points = 200000
 path = "spt100.vtu"
 
 [[extraction_lines]]
-# Axial centerline through the plume, including the exit-plane point.
+# Channel centerline
 name = "plume_centerline"
 points = [
-  { z = 0.025, r = 0.0 },
-  { z = 0.100, r = 0.0 },
+  { z = 0.000, r = 0.425 },
+  { z = 0.100, r = 0.425 },
 ]
 num_points = 101
 method = "direct"

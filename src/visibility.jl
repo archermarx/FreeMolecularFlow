@@ -1,5 +1,7 @@
 const Vec3 = NTuple{3,Float64}
 
+# Tiny tuple-based vector operations avoid allocating temporary Vector objects
+# in the innermost visibility and solid-angle loops.
 _vadd(a::Vec3,b::Vec3) = (a[1]+b[1],a[2]+b[2],a[3]+b[3])
 _vsub(a::Vec3,b::Vec3) = (a[1]-b[1],a[2]-b[2],a[3]-b[3])
 _vscale(a::Vec3,s::Real) = (a[1]*s,a[2]*s,a[3]*s)
@@ -12,11 +14,13 @@ struct SurfacePatch
     vertices::NTuple{3,Vec3}
     center::Vec3
     normal::Vec3
-    area::Float64       # exact-area-rescaled quadrature weight
-    geometric_area::Float64
-    segment::Int
+    area::Float64       # Exact-area-rescaled integration weight [m²].
+    geometric_area::Float64 # Area of the flat triangulated approximation [m²].
+    segment::Int        # Parent BoundarySegment index.
 end
 
+# Nodes with left == 0 are leaves and carry patch indices. Interior nodes store
+# child indices only. Array indices replace pointers for compact traversal.
 struct BVHNode
     lo::Vec3
     hi::Vec3
@@ -31,12 +35,16 @@ struct PatchBVH
     patches::Vector{SurfacePatch}
 end
 
+# Embed (z,r) at azimuth θ in Cartesian (z,x,y). Keeping z first means output
+# velocity components naturally remain ordered (axial, radial, azimuthal).
 _xyz(p, theta) = (p[1], p[2]*cos(theta), p[2]*sin(theta))
 
 function _raw_patch(vertices, desired_normal, segment)
     a,b,c = vertices
     cr = _cross(_vsub(b,a), _vsub(c,a))
     area = _norm(cr)/2
+    # Wedges meeting the symmetry axis can collapse one of their two triangles.
+    # Such zero-area pieces carry no flux and must not enter the BVH.
     area <= 100eps(Float64) && return nothing
     normal = _vscale(cr, inv(2area))
     _dot(normal, desired_normal) < 0 && (normal = _vscale(normal,-1))
@@ -45,6 +53,8 @@ function _raw_patch(vertices, desired_normal, segment)
 end
 
 function _revolve_segments(segments::Vector{BoundarySegment}, ntheta::Int)
+    # Each R-Z segment sweeps out a conical frustum. Approximate that frustum by
+    # two triangles per azimuthal wedge for visibility tests and solid angles.
     patches = SurfacePatch[]
     for (is,s) in pairs(segments)
         first_patch = length(patches)+1
@@ -62,6 +72,9 @@ function _revolve_segments(segments::Vector{BoundarySegment}, ntheta::Int)
             end
         end
         last_patch = length(patches)
+        # A polygonal ring has slightly less area than the smooth surface of
+        # revolution. Rescale integration weights to the analytic frustum area;
+        # geometry remains flat only for ray intersection purposes.
         approximate_area = sum(patches[i].geometric_area for i in first_patch:last_patch)
         scale = s.area / approximate_area
         for i in first_patch:last_patch
@@ -80,6 +93,8 @@ function _patch_bounds(p::SurfacePatch)
 end
 
 function _build_bvh(patches::Vector{SurfacePatch}; leaf_size=8)
+    # Median-split the longest bounding-box axis. This is inexpensive to build
+    # and substantially reduces the O(N) triangle tests for every sight line.
     nodes = BVHNode[]
     function build(indices)
         lows_highs = (_patch_bounds(patches[i]) for i in indices)
@@ -105,6 +120,8 @@ function _build_bvh(patches::Vector{SurfacePatch}; leaf_size=8)
 end
 
 function _segment_hits_box(origin::Vec3, direction::Vec3, lo::Vec3, hi::Vec3, tol)
+    # Slab intersection over t ∈ [0,1]. `direction` is the complete displacement
+    # from origin to endpoint rather than a unit ray.
     tmin, tmax = 0.0, 1.0
     for k in 1:3
         if abs(direction[k]) < eps(Float64)
@@ -121,6 +138,8 @@ function _segment_hits_box(origin::Vec3, direction::Vec3, lo::Vec3, hi::Vec3, to
 end
 
 function _ray_triangle_t(origin::Vec3, direction::Vec3, patch::SurfacePatch, tol)
+    # Two-sided Möller–Trumbore intersection. Visibility cares whether any wall
+    # blocks the segment, independent of which side of that wall is encountered.
     a,b,c = patch.vertices
     edge1, edge2 = _vsub(b,a), _vsub(c,a)
     h = _cross(direction,edge2)
@@ -147,6 +166,8 @@ function _occluded(bvh::PatchBVH, origin::Vec3, endpoint::Vec3,
             for ip in node.patches
                 (ip == ignore1 || ip == ignore2) && continue
                 t = _ray_triangle_t(origin,direction,bvh.patches[ip],tol)
+                # Ignore intersections at either endpoint; these are normally
+                # the emitting/receiving patches themselves or shared edges.
                 t === nothing || (tol < t < 1-tol && return true)
             end
         else
@@ -157,6 +178,8 @@ function _occluded(bvh::PatchBVH, origin::Vec3, endpoint::Vec3,
 end
 
 function _solid_angle(point::Vec3, patch::SurfacePatch)
+    # Van Oosterom–Strackee's stable closed form for a triangular solid angle.
+    # atan(y,x) retains the correct quadrant for large apparent triangles.
     a,b,c = (_vsub(v,point) for v in patch.vertices)
     la,lb,lc = _norm(a),_norm(b),_norm(c)
     numerator = abs(_dot(a,_cross(b,c)))
@@ -165,6 +188,9 @@ function _solid_angle(point::Vec3, patch::SurfacePatch)
 end
 
 function _vector_solid_angle(point::Vec3, patch::SurfacePatch)
+    # Integral of the unit direction vector over a spherical triangle. Each
+    # great-circle edge contributes its unit normal times half its arc angle.
+    # This moment yields bulk velocity without a center-ray approximation.
     u = ntuple(i -> _unit(_vsub(patch.vertices[i],point)),3)
     value = (0.0,0.0,0.0)
     for (a,b) in ((u[1],u[2]),(u[2],u[3]),(u[3],u[1]))
@@ -183,6 +209,8 @@ end
 _area_scale(p::SurfacePatch) = p.area / p.geometric_area
 
 function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta, reporter=nothing)
+    # conductance[i,j] has units of area and equals A_i H_ij. Storing this
+    # reciprocal form makes the eventual symmetry condition explicit.
     ns = length(mesh.boundary_segments)
     conductance = zeros(ns,ns)
     wedge = 2pi/ntheta
@@ -202,10 +230,14 @@ function _boundary_exchange(mesh::RZMesh, patches, bvh, tol, ntheta, reporter=no
             distance = _norm(direction)
             distance <= tol && continue
             ray = _vscale(direction,inv(distance))
+            # Both gas-side normals must face the line connecting the patches.
+            # q sees the opposite ray direction, hence its leading minus sign.
             cos_p, cos_q = _dot(p.normal,ray), -_dot(q.normal,ray)
             (cos_p > 0 && cos_q > 0) || continue
             _occluded(bvh,p.center,q.center,ip,jp,tol) && continue
             omega_q = _solid_angle(p.center,q) * _area_scale(q)
+            # Diffuse (Lambertian) exchange: dH = cos(θ_receiver)dΩ_emitter/π.
+            # The receiver patch represents every identical azimuthal wedge.
             g = ntheta * p.area*cos_p*omega_q/pi
             g > 0 || continue
             conductance[p.segment,q.segment] += g
