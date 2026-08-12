@@ -1,0 +1,42 @@
+[gas]
+# Xenon atomic mass.
+molecular_mass_amu = 131.293
+
+[geometry]
+# One counter-clockwise polygon in [z, r] metres. Clockwise input is also
+# accepted and normalised. Edge i connects point i to point i+1 cyclically.
+points = [
+  [0.000, 0.000],
+  [0.050, 0.000],
+  [0.050, 0.030],
+  [0.000, 0.030],
+]
+edge_labels = ["axis", "vacuum", "outer_wall", "anode"]
+
+[boundaries.axis]
+type = "axis"
+
+[boundaries.vacuum]
+type = "back_pressure"
+pressure = 0.0
+temperature = 300.0
+
+[boundaries.outer_wall]
+type = "diffuse_wall"
+temperature = 500.0
+
+[boundaries.anode]
+type = "inflow"
+mass_flow_rate = 5.0e-6
+temperature = 700.0
+
+[solver]
+max_area = 2.5e-5
+min_angle = 20.0
+azimuthal_divisions = 64
+radiosity_tolerance = 1.0e-10
+visibility_tolerance = 1.0e-10
+max_mesh_points = 200000
+
+[output]
+path = "hall_channel.vtu"
