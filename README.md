@@ -63,10 +63,26 @@ boundaries = Dict(
     "anode"  => Inflow(5e-6, 700.0))
 
 gas = Gas(131.293; unit=:amu)
-options = SolverOptions(max_area=2.5e-5, azimuthal_divisions=64)
+options = SolverOptions(max_area=2.5e-5, max_boundary_length=5e-3,
+                        azimuthal_divisions=64)
 result = solve(geometry, boundaries, gas; options)
 write_vtk("hall_channel.vtu", result)
 ```
+
+For parameter sweeps, prepare the geometry-dependent transport operator once:
+
+```julia
+prepared = prepare(geometry, boundaries; options)
+result_1 = solve(prepared, gas)
+
+updated = copy(boundaries)
+updated["anode"] = Inflow(7e-6, 700.0)
+result_2 = solve(prepared, updated, gas)
+```
+
+The mesh, revolved surface, visibility hierarchy, boundary-exchange matrix, and
+cell solid-angle moments are reused. Replacement boundaries must use the same
+geometry labels, but their values and types may change.
 
 Polygon orientation is normalized internally. The polygon must not intersect
 itself, all radii must be nonnegative, and any edge wholly on `r=0` must be an
@@ -105,8 +121,23 @@ density and the exact vector solid-angle moment gives mean velocity. The
 new geometry.
 
 Increasing `azimuthal_divisions` resolves the surfaces of revolution more
-accurately. Decreasing `max_area` refines the R–Z output mesh and boundary
-segmentation. A zero `max_area` selects one two-hundredth of the polygon area.
+accurately. Decreasing `max_area` refines the R–Z output mesh. A zero `max_area`
+selects one two-hundredth of the polygon area.
+`max_boundary_length` independently limits the R–Z length of transport boundary
+segments. Set it explicitly when refining the volume mesh so the exchange
+matrix and revolved source count remain fixed; zero selects an automatic value
+of twice the characteristic cell length.
+Even values of `azimuthal_divisions` are preferred: their mirrored surface
+quadrature lets field reconstruction evaluate half of each ring. Odd values
+remain supported and use the full ring.
+
+Field reconstruction uses every Julia worker thread made available at process
+startup. For example, run the command-line solver on the automatically selected
+thread count with:
+
+```sh
+julia --threads=auto --project=. bin/free_molecular_flow.jl case.toml
+```
 
 ## VTK fields
 

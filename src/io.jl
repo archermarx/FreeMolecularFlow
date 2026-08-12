@@ -43,16 +43,64 @@ function write_vtk(filename::AbstractString, result::FlowResult)
     only(files)
 end
 
-function _containing_cell(mesh::RZMesh, point::NTuple{2,Float64})
-    # Cells were normalized counter-clockwise during meshing. A point lies in a
-    # triangle when it is on the left of (or numerically on) every directed edge.
-    # Returning zero gives callers a cheap sentinel for outside-domain samples.
+struct CellLocator
+    mesh::RZMesh
+    lo::NTuple{2,Float64}
+    hi::NTuple{2,Float64}
+    dimensions::NTuple{2,Int}
+    bin_scale::NTuple{2,Float64}
+    bins::Vector{Vector{Int}}
+    tolerance::Float64
+end
+
+_bin_index(value,origin,scale,count) =
+    clamp(floor(Int,(value-origin)*scale)+1,1,count)
+
+function _cell_contains(mesh::RZMesh,cell::Int,point,tolerance)
+    t = mesh.cells[cell]
+    a,b,c = mesh.points[t[1]],mesh.points[t[2]],mesh.points[t[3]]
+    o1,o2,o3 = _orient(a,b,point),_orient(b,c,point),_orient(c,a,point)
+    o1 >= -tolerance && o2 >= -tolerance && o3 >= -tolerance
+end
+
+function _build_cell_locator(mesh::RZMesh)
+    # A compact uniform grid gives nearly constant-time point candidates for
+    # large extraction paths. Triangle bounding boxes are inserted into every
+    # bin they overlap, so points on cell or bin edges remain robust.
     scale = maximum(abs,Iterators.flatten(mesh.points);init=1.0)
     tolerance = 1e-12*max(scale,1.0)^2
-    for (i,t) in pairs(mesh.cells)
+    lo = (minimum(first,mesh.points),minimum(last,mesh.points))
+    hi = (maximum(first,mesh.points),maximum(last,mesh.points))
+    width = max(hi[1]-lo[1],eps(Float64))
+    height = max(hi[2]-lo[2],eps(Float64))
+    aspect = width/height
+    nx = max(1,round(Int,sqrt(length(mesh.cells)*aspect)))
+    ny = max(1,ceil(Int,length(mesh.cells)/nx))
+    bin_scale = (nx/width,ny/height)
+    bins = [Int[] for _ in 1:nx*ny]
+    for (cell,t) in pairs(mesh.cells)
         a,b,c = mesh.points[t[1]],mesh.points[t[2]],mesh.points[t[3]]
-        o1,o2,o3 = _orient(a,b,point),_orient(b,c,point),_orient(c,a,point)
-        o1 >= -tolerance && o2 >= -tolerance && o3 >= -tolerance && return i
+        ix0 = _bin_index(min(a[1],b[1],c[1]),lo[1],bin_scale[1],nx)
+        ix1 = _bin_index(max(a[1],b[1],c[1]),lo[1],bin_scale[1],nx)
+        iy0 = _bin_index(min(a[2],b[2],c[2]),lo[2],bin_scale[2],ny)
+        iy1 = _bin_index(max(a[2],b[2],c[2]),lo[2],bin_scale[2],ny)
+        for iy in iy0:iy1, ix in ix0:ix1
+            push!(bins[ix+nx*(iy-1)],cell)
+        end
+    end
+    CellLocator(mesh,lo,hi,(nx,ny),bin_scale,bins,tolerance)
+end
+
+function _containing_cell(locator::CellLocator,point::NTuple{2,Float64})
+    lo,hi = locator.lo,locator.hi
+    tol = locator.tolerance
+    (lo[1]-tol <= point[1] <= hi[1]+tol &&
+     lo[2]-tol <= point[2] <= hi[2]+tol) || return 0
+    nx,ny = locator.dimensions
+    ix = _bin_index(point[1],lo[1],locator.bin_scale[1],nx)
+    iy = _bin_index(point[2],lo[2],locator.bin_scale[2],ny)
+    for cell in locator.bins[ix+nx*(iy-1)]
+        _cell_contains(locator.mesh,cell,point,tol) && return cell
     end
     0
 end
@@ -114,36 +162,23 @@ function _extraction_columns(line::ExtractionLine, labels, names)
     columns
 end
 
-function _prepare_direct_evaluator(result::FlowResult)
-    # FlowResult stores the refined boundary and solver options, but not the
-    # relatively bulky patch/BVH cache. Rebuild it once and share it across all
-    # direct extraction paths requested by a configuration.
-    patches = _revolve_segments(result.mesh.boundary_segments,
-                                result.options.azimuthal_divisions)
-    bvh = _build_bvh(patches)
-    scale = maximum(abs,Iterators.flatten(result.mesh.points);init=1.0)
-    tol = result.options.visibility_tolerance*max(scale,1.0)
-    (;patches,bvh,tol)
-end
-
-function _write_extracted_values(io, line, labels, density, velocity,
-                                 direct, contributions, index)
+function _write_extracted_values(io,line,labels,values,index)
     if :number_density in line.fields
-        print(io,','); _csv_value(io,density[index])
+        print(io,','); _csv_value(io,values.density[index])
     end
     if :velocity in line.fields
         for component in 1:3
-            print(io,','); _csv_value(io,velocity[component,index])
+            print(io,','); _csv_value(io,values.velocity[component,index])
         end
     end
     if :view_factors in line.fields
         for label in labels
-            print(io,','); _csv_value(io,direct[label][index])
+            print(io,','); _csv_value(io,values.direct[label][index])
         end
     end
     if :density_contributions in line.fields
         for label in labels
-            print(io,','); _csv_value(io,contributions[label][index])
+            print(io,','); _csv_value(io,values.contributions[label][index])
         end
     end
 end
@@ -157,13 +192,14 @@ locations; cell evaluation uses the containing triangle's cell-centered value.
 """
 function write_extraction_line(filename::AbstractString, result::FlowResult,
                                line::ExtractionLine; evaluator=nothing,
-                               reporter=nothing)
+                               locator=nothing,reporter=nothing)
     names = _vtk_names(result.labels)
     columns = _extraction_columns(line,result.labels,names)
     samples = _path_samples(line)
     # Domain membership is determined from the R-Z solution mesh even in direct
     # mode. Direct evaluation changes field accuracy, not what counts as gas.
-    cells = [_containing_cell(result.mesh,sample.point) for sample in samples]
+    locator === nothing && (locator = _build_cell_locator(result.mesh))
+    cells = [_containing_cell(locator,sample.point) for sample in samples]
     outside = findall(==(0),cells)
     if line.outside_domain === :error && !isempty(outside)
         first_outside = samples[first(outside)]
@@ -173,25 +209,28 @@ function write_extraction_line(filename::AbstractString, result::FlowResult,
     kept = line.outside_domain === :drop ? findall(!=(0),cells) : collect(eachindex(samples))
 
     inside_indices = findall(!=(0),cells)
+    cell_values = (;density=result.density,velocity=result.velocity,
+                   direct=result.direct_view_factors,
+                   contributions=result.density_contributions)
     direct_values = nothing
-    direct_lookup = Dict{Int,Int}()
+    direct_lookup = zeros(Int,length(samples))
     _status!(reporter,:line_extraction,0;total=length(inside_indices),force=true)
     if line.method === :direct && !isempty(inside_indices)
         # Evaluate only interior points; outside samples, when retained, receive
         # empty solution columns and never participate in expensive ray tracing.
-        evaluator === nothing && (evaluator = _prepare_direct_evaluator(result))
+        evaluator === nothing && (evaluator = result.evaluator)
         points = [samples[i].point for i in inside_indices]
         _,direct,contributions,density,velocity = _evaluate_fields(
-            result.mesh,points,evaluator.patches,evaluator.bvh,
+            result.mesh,points,evaluator.bvh.patches,evaluator.bvh,
             result.boundary_flux,result.gas,evaluator.tol;
+            ntheta=result.options.azimuthal_divisions,
             reporter,phase=:line_extraction,
             closure=result.exchange_closure_error,
             radiosity=result.radiosity_residual)
         direct_values = (;direct,contributions,density,velocity)
         # Direct arrays are compacted to interior points, so map original path
         # sample indices back to their row in those arrays during CSV emission.
-        direct_lookup = Dict(sample_index=>value_index
-                             for (value_index,sample_index) in pairs(inside_indices))
+        direct_lookup[inside_indices] .= eachindex(inside_indices)
     end
 
     mkpath(dirname(abspath(filename)))
@@ -206,16 +245,9 @@ function write_extraction_line(filename::AbstractString, result::FlowResult,
             print(io,','); _csv_value(io,sample.point[2])
             print(io,',',cell > 0,',',cell)
             if cell > 0
-                if line.method === :cell
-                    _write_extracted_values(io,line,result.labels,result.density,
-                        result.velocity,result.direct_view_factors,
-                        result.density_contributions,cell)
-                else
-                    value_index = direct_lookup[sample_index]
-                    _write_extracted_values(io,line,result.labels,
-                        direct_values.density,direct_values.velocity,
-                        direct_values.direct,direct_values.contributions,value_index)
-                end
+                values = line.method === :cell ? cell_values : direct_values
+                value_index = line.method === :cell ? cell : direct_lookup[sample_index]
+                _write_extracted_values(io,line,result.labels,values,value_index)
             else
                 for _ in 1:(length(columns)-8)
                     print(io,',')
@@ -244,15 +276,15 @@ end
 function _parse_boundary(table, label)
     # A few unambiguous aliases make hand-written TOML forgiving. Specular is
     # recognized only to provide a precise unsupported-physics diagnostic.
-    kind = lowercase(String(_required(table,"type","boundaries.$label")))
+    context = "boundaries.$label"
+    required(key) = _required(table,key,context)
+    kind = lowercase(String(required("type")))
     if kind == "inflow"
-        Inflow(_required(table,"mass_flow_rate","boundaries.$label"),
-               _required(table,"temperature","boundaries.$label"))
+        Inflow(required("mass_flow_rate"),required("temperature"))
     elseif kind in ("back_pressure","backpressure","outlet")
-        BackPressure(_required(table,"pressure","boundaries.$label"),
-                     _required(table,"temperature","boundaries.$label"))
+        BackPressure(required("pressure"),required("temperature"))
     elseif kind in ("diffuse_wall","diffuse","wall")
-        DiffuseWall(_required(table,"temperature","boundaries.$label"))
+        DiffuseWall(required("temperature"))
     elseif kind == "axis"
         Axis()
     elseif kind in ("specular","specular_wall")
@@ -261,6 +293,15 @@ function _parse_boundary(table, label)
         throw(ArgumentError("unknown boundary type `$kind` for label `$label`"))
     end
 end
+
+function _parse_gas(table)
+    haskey(table,"molecular_mass_amu") && return Gas(table["molecular_mass_amu"];unit=:amu)
+    haskey(table,"molecular_mass_kg") && return Gas(table["molecular_mass_kg"])
+    throw(ArgumentError("gas requires molecular_mass_amu or molecular_mass_kg"))
+end
+
+_case_path(config_path,path) =
+    isabspath(path) ? path : joinpath(dirname(abspath(config_path)),path)
 
 """Load geometry, boundary conditions, gas, solver options, and output path from TOML."""
 function load_config(path::AbstractString)
@@ -272,14 +313,7 @@ function load_config(path::AbstractString)
     labels = _required(gtab,"edge_labels","geometry")
     geometry = AxisymmetricGeometry(points,labels)
 
-    gastab = _required(cfg,"gas","configuration")
-    if haskey(gastab,"molecular_mass_amu")
-        gas = Gas(gastab["molecular_mass_amu"];unit=:amu)
-    elseif haskey(gastab,"molecular_mass_kg")
-        gas = Gas(gastab["molecular_mass_kg"])
-    else
-        throw(ArgumentError("gas requires molecular_mass_amu or molecular_mass_kg"))
-    end
+    gas = _parse_gas(_required(cfg,"gas","configuration"))
 
     btab = _required(cfg,"boundaries","configuration")
     boundaries = Dict{String,BoundaryCondition}(
@@ -288,6 +322,7 @@ function load_config(path::AbstractString)
     opt = get(cfg,"solver",Dict{String,Any}())
     options = SolverOptions(
         max_area=Float64(get(opt,"max_area",0.0)),
+        max_boundary_length=Float64(get(opt,"max_boundary_length",0.0)),
         min_angle=Float64(get(opt,"min_angle",20.0)),
         azimuthal_divisions=Int(get(opt,"azimuthal_divisions",64)),
         radiosity_tolerance=Float64(get(opt,"radiosity_tolerance",1e-10)),
@@ -322,26 +357,26 @@ end
 """Run a TOML configuration and write its VTK output."""
 function run_config(path::AbstractString; status_interval::Real=0.0,
                     status_io::IO=stdout)
-    status_interval >= 0 || throw(ArgumentError("status_interval must be nonnegative"))
     config = load_config(path)
-    reporter = status_interval > 0 ? StatusReporter(status_interval,status_io) : nothing
+    reporter = _make_reporter(status_interval,status_io,nothing)
     result = solve(config.geometry,config.boundaries,config.gas;
                    options=config.options,status_reporter=reporter)
     # All relative outputs are case-relative, not process-working-directory
     # relative. A case can therefore be launched reliably from any directory.
-    output = isabspath(config.output) ? config.output : joinpath(dirname(abspath(path)),config.output)
+    output = _case_path(path,config.output)
     mkpath(dirname(output))
     written = write_vtk(output,result)
     extraction_files = String[]
     # Surface construction is independent of the extraction path; share it
     # whenever more than one line requests exact direct evaluation.
     evaluator = any(line -> line.method === :direct,config.extraction_lines) ?
-                _prepare_direct_evaluator(result) : nothing
+                result.evaluator : nothing
+    locator = isempty(config.extraction_lines) ? nothing :
+              _build_cell_locator(result.mesh)
     for line in config.extraction_lines
-        path_out = isabspath(line.filename) ? line.filename :
-                   joinpath(dirname(abspath(path)),line.filename)
+        path_out = _case_path(path,line.filename)
         push!(extraction_files,write_extraction_line(path_out,result,line;
-                                                     evaluator,reporter))
+                                                     evaluator,locator,reporter))
     end
     @printf("cells: %d\n",length(result.mesh.cells))
     @printf("radiosity residual: %.6e\n",result.radiosity_residual)

@@ -5,7 +5,10 @@ function _normalise_boundaries(boundaries)
 end
 
 function _validate_options(options::SolverOptions)
-    options.max_area >= 0 || throw(ArgumentError("max_area must be nonnegative (zero selects an automatic value)"))
+    isfinite(options.max_area) && options.max_area >= 0 ||
+        throw(ArgumentError("max_area must be finite and nonnegative (zero selects an automatic value)"))
+    isfinite(options.max_boundary_length) && options.max_boundary_length >= 0 ||
+        throw(ArgumentError("max_boundary_length must be finite and nonnegative (zero selects an automatic value)"))
     0 < options.min_angle < 34 || throw(ArgumentError("min_angle must lie in (0,34) degrees"))
     options.azimuthal_divisions >= 4 || throw(ArgumentError("azimuthal_divisions must be at least 4"))
     options.radiosity_tolerance > 0 || throw(ArgumentError("radiosity_tolerance must be positive"))
@@ -13,31 +16,17 @@ function _validate_options(options::SolverOptions)
     options.max_mesh_points >= 3 || throw(ArgumentError("max_mesh_points must be at least 3"))
 end
 
-function _original_edge_index(point_a, point_b, geometry::AxisymmetricGeometry)
-    # Delaunay refinement splits input edges. Recover the parent input edge so
-    # every child segment inherits the user's physical boundary label.
-    scale = maximum(abs, Iterators.flatten(geometry.points); init=1.0)
-    atol = 2e-9 * max(scale, 1.0)
-    for i in eachindex(geometry.points)
-        a, b = geometry.points[i], geometry.points[mod1(i+1, length(geometry.points))]
-        if _on_segment(a, b, point_a; atol) && _on_segment(a, b, point_b; atol)
-            return i
-        end
-    end
-    throw(ErrorException("mesh refinement created a boundary edge that cannot be mapped to the input polygon"))
-end
-
 function _triangle_area(a,b,c)
     abs(_orient(a,b,c)) / 2
 end
 
-function _make_mesh(geometry::AxisymmetricGeometry, boundaries, options::SolverOptions)
-    _validate_options(options)
+function _validate_boundaries(geometry::AxisymmetricGeometry,boundaries)
     bc = _normalise_boundaries(boundaries)
-    used_labels = unique(geometry.edge_labels)
-    missing = setdiff(used_labels, collect(keys(bc)))
+    labels = unique(geometry.edge_labels)
+    supplied = collect(keys(bc))
+    missing = setdiff(labels,supplied)
     isempty(missing) || throw(ArgumentError("missing boundary conditions for labels: $(join(missing, ", "))"))
-    extras = setdiff(collect(keys(bc)), used_labels)
+    extras = setdiff(supplied,labels)
     isempty(extras) || throw(ArgumentError("boundary conditions supplied for unused labels: $(join(extras, ", "))"))
 
     # The axis is a topological boundary of the 2-D polygon but has zero area in
@@ -52,6 +41,40 @@ function _make_mesh(geometry::AxisymmetricGeometry, boundaries, options::SolverO
             throw(ArgumentError("Axis() boundary $(geometry.edge_labels[i]) must lie entirely on r=0"))
         end
     end
+    bc
+end
+
+function _make_boundary_segments(geometry::AxisymmetricGeometry,bc,
+                                 max_boundary_length::Float64)
+    segments = BoundarySegment[]
+    for i in eachindex(geometry.points)
+        parent_a = geometry.points[i]
+        parent_b = geometry.points[mod1(i+1,length(geometry.points))]
+        label = geometry.edge_labels[i]
+        condition = bc[label]
+        condition isa Axis && continue
+        dz, dr = parent_b[1]-parent_a[1], parent_b[2]-parent_a[2]
+        length_rz = hypot(dz,dr)
+        pieces = max(1,ceil(Int,length_rz/max_boundary_length))
+        step_z, step_r = dz/pieces, dr/pieces
+        for k in 0:pieces-1
+            a = (parent_a[1]+k*step_z,parent_a[2]+k*step_r)
+            b = (a[1]+step_z,a[2]+step_r)
+            # Lateral area of the conical frustum swept out by this R-Z piece.
+            area = pi*(a[2]+b[2])*length_rz/pieces
+            area <= 10eps(Float64) && continue
+            push!(segments,BoundarySegment(a,b,label,condition,area))
+        end
+    end
+    isempty(segments) && throw(ArgumentError(
+        "geometry has no nonzero-area physical boundaries"))
+    sort!(segments;by=s -> (s.label,s.a,s.b)) # Deterministic matrix ordering.
+    segments
+end
+
+function _make_mesh(geometry::AxisymmetricGeometry, boundaries, options::SolverOptions)
+    _validate_options(options)
+    bc = _validate_boundaries(geometry,boundaries)
 
     # Give the constrained triangulator a closed boundary-node cycle. Keeping
     # ghost triangles until iteration lets its `each_solid_*` accessors cleanly
@@ -89,25 +112,12 @@ function _make_mesh(geometry::AxisymmetricGeometry, boundaries, options::SolverO
         push!(volumes, 2pi * center[2] * _triangle_area(a,b,c))
     end
 
-    segments = BoundarySegment[]
-    for e in each_segment(tri)
-        a, b = mesh_points[Int(e[1])], mesh_points[Int(e[2])]
-        original = _original_edge_index(a, b, geometry)
-        oa, ob = geometry.points[original], geometry.points[mod1(original+1,length(geometry.points))]
-        # Segment iteration does not promise orientation. Match each refined
-        # child to its parent so the inward normal points toward the gas domain.
-        if (b[1]-a[1])*(ob[1]-oa[1]) + (b[2]-a[2])*(ob[2]-oa[2]) < 0
-            a, b = b, a
-        end
-        label = geometry.edge_labels[original]
-        condition = bc[label]
-        slant = hypot(b[1]-a[1], b[2]-a[2])
-        # Lateral area of the conical frustum swept out by this R-Z segment.
-        area = pi * (a[2] + b[2]) * slant
-        area <= 10eps(Float64) && continue # symmetry axis
-        push!(segments, BoundarySegment(a,b,label,condition,area))
-    end
-    isempty(segments) && throw(ArgumentError("geometry has no nonzero-area physical boundaries"))
-    sort!(segments; by=s -> (s.label, s.a, s.b))
+    # Transport segments are generated independently of the triangulator. This
+    # prevents volume refinement from multiplying the boundary-exchange matrix.
+    # The automatic length tracks the cell scale; specifying a positive value
+    # fully decouples boundary and volume resolution.
+    boundary_length = options.max_boundary_length > 0 ?
+                      options.max_boundary_length : 2sqrt(max_area)
+    segments = _make_boundary_segments(geometry,bc,boundary_length)
     return RZMesh(mesh_points, cells, centers, volumes, segments)
 end

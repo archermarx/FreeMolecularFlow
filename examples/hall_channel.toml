@@ -32,6 +32,8 @@ temperature = 700.0
 
 [solver]
 max_area = 2.5e-5
+# Transport-boundary resolution is independent of the R-Z output mesh.
+max_boundary_length = 5.0e-3
 min_angle = 20.0
 azimuthal_divisions = 64
 radiosity_tolerance = 1.0e-10

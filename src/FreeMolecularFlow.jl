@@ -9,7 +9,8 @@ using TOML
 using WriteVTK
 
 export AxisymmetricGeometry, Gas, Inflow, BackPressure, DiffuseWall, Axis,
-       SolverOptions, FlowResult, solve, write_vtk, load_config, run_config,
+       SolverOptions, PreparedSolver, FlowResult, prepare, solve,
+       write_vtk, load_config, run_config,
        ExtractionLine, write_extraction_line, number_density,
        mean_molecular_speed
 

@@ -104,6 +104,7 @@ end
 
 Base.@kwdef struct SolverOptions
     max_area::Float64 = 0.0             # Maximum R-Z triangle area [m²]; 0 is automatic.
+    max_boundary_length::Float64 = 0.0  # Maximum transport-segment length [m]; 0 is automatic.
     min_angle::Float64 = 20.0           # Delaunay mesh-quality target [degrees].
     azimuthal_divisions::Int = 64       # Wedges used to revolve every boundary segment.
     radiosity_tolerance::Float64 = 1e-10 # Linear-solve conditioning/residual tolerance.
@@ -113,6 +114,13 @@ end
 
 const EXTRACTION_FIELDS = (:number_density, :velocity, :view_factors,
                            :density_contributions)
+
+function _extraction_choice(value, name, allowed)
+    choice = Symbol(lowercase(String(value)))
+    choice in allowed || throw(ArgumentError(
+        "extraction-line $name must be " * join("`" .* string.(allowed) .* "`", ", ")))
+    choice
+end
 
 """
 A uniformly sampled straight or piecewise-linear path in the R-Z plane.
@@ -146,32 +154,30 @@ struct ExtractionLine
             throw(ArgumentError("extraction-line radius r must be nonnegative"))
         all(i -> pts[i] != pts[i+1],1:length(pts)-1) ||
             throw(ArgumentError("adjacent extraction-line control points must differ"))
-        (num_points === nothing) != (spacing === nothing) ||
-            throw(ArgumentError("extraction line requires exactly one of num_points or spacing"))
-        count = num_points === nothing ? nothing : Int(num_points)
-        count === nothing || count >= 2 ||
-            throw(ArgumentError("extraction-line num_points must be at least 2"))
-        step = spacing === nothing ? nothing : Float64(spacing)
-        step === nothing || (isfinite(step) && step > 0) ||
-            throw(ArgumentError("extraction-line spacing must be finite and positive"))
-        method_symbol = Symbol(lowercase(String(method)))
-        method_symbol in (:direct,:cell) ||
-            throw(ArgumentError("extraction-line method must be `direct` or `cell`"))
-        outside_symbol = Symbol(lowercase(String(outside_domain)))
-        outside_symbol in (:keep,:drop,:error) || throw(ArgumentError(
-            "extraction-line outside_domain must be `keep`, `drop`, or `error`"))
+
+        (isnothing(num_points) != isnothing(spacing)) || throw(ArgumentError(
+            "extraction line requires exactly one of num_points or spacing"))
+        count = isnothing(num_points) ? nothing : Int(num_points)
+        step = isnothing(spacing) ? nothing : Float64(spacing)
+        isnothing(count) || count >= 2 || throw(ArgumentError(
+            "extraction-line num_points must be at least 2"))
+        isnothing(step) || (isfinite(step) && step > 0) || throw(ArgumentError(
+            "extraction-line spacing must be finite and positive"))
+
+        method_symbol = _extraction_choice(method,"method",(:direct,:cell))
+        outside_symbol = _extraction_choice(
+            outside_domain,"outside_domain",(:keep,:drop,:error))
         selected = Symbol[Symbol(lowercase(String(field))) for field in fields]
         isempty(selected) && throw(ArgumentError("extraction-line fields may not be empty"))
-        length(unique(selected)) == length(selected) ||
-            throw(ArgumentError("extraction-line fields may not contain duplicates"))
-        unknown = setdiff(selected,collect(EXTRACTION_FIELDS))
+        length(unique(selected)) == length(selected) || throw(ArgumentError(
+            "extraction-line fields may not contain duplicates"))
+        unknown = setdiff(selected,EXTRACTION_FIELDS)
         isempty(unknown) || throw(ArgumentError(
             "unknown extraction fields: $(join(string.(unknown), ", "))"))
-        filename_stem = strip(replace(lowercase(clean_name),
-                                      r"[^a-z0-9_-]+" => "_"),'_')
-        isempty(filename_stem) && (filename_stem = "extraction")
-        default_filename = filename_stem * ".csv"
-        output = filename === nothing ? default_filename : String(filename)
+
+        stem = strip(replace(lowercase(clean_name),r"[^a-z0-9_-]+" => "_"),'_')
+        default_filename = (isempty(stem) ? "extraction" : stem) * ".csv"
+        output = isnothing(filename) ? default_filename : String(filename)
         isempty(strip(output)) && throw(ArgumentError("extraction-line filename may not be empty"))
         new(clean_name,pts,count,step,method_symbol,outside_symbol,selected,output)
     end
@@ -192,9 +198,7 @@ function StatusReporter(interval::Real, io::IO)
     StatusReporter(Float64(interval),io,now,now-Float64(interval),false)
 end
 
-function _residual_text(value)
-    isfinite(value) ? @sprintf("%.3e",value) : "-"
-end
+_residual_text(value) = isfinite(value) ? @sprintf("%.3e",value) : "-"
 
 const _STATUS_PHASE_NAMES = Dict(
     :mesh => "mesh",
@@ -202,6 +206,7 @@ const _STATUS_PHASE_NAMES = Dict(
     :boundary_exchange => "exchange",
     :exchange_balance => "balance",
     :radiosity => "radiosity",
+    :field_precompute => "moments",
     :field_reconstruction => "fields",
     :line_extraction => "extract",
     :complete => "complete")
@@ -232,6 +237,14 @@ function _status!(reporter::Union{Nothing,StatusReporter}, phase::Symbol,
     reporter.last_printed = now
 end
 
+function _thread_status!(reporter,mutex,completed,phase,total;kwargs...)
+    reporter === nothing && return
+    iteration = Threads.atomic_add!(completed,1) + 1
+    lock(mutex) do
+        _status!(reporter,phase,iteration;total,kwargs...)
+    end
+end
+
 struct BoundarySegment
     # Endpoints follow the normalized counter-clockwise polygon direction. This
     # orientation makes the gas-side normal unambiguous during revolution.
@@ -250,31 +263,6 @@ struct RZMesh
     volumes::Vector{Float64}
     boundary_segments::Vector{BoundarySegment}
 end
-
-"""
-Results of a steady free-molecular calculation.
-
-All spatial arrays are cell-centered. Per-label dictionaries separate direct
-geometric visibility from the actual density contribution after diffuse-wall
-recycling. The saved gas and options allow exact direct evaluation later when
-writing extraction lines.
-"""
-struct FlowResult
-    mesh::RZMesh
-    labels::Vector{String}
-    direct_view_factors::Dict{String,Vector{Float64}}
-    density_contributions::Dict{String,Vector{Float64}}
-    density::Vector{Float64}
-    velocity::Matrix{Float64}       # 3 × ncells, ordered (z,r,azimuthal)
-    boundary_flux::Vector{Float64}  # particles m^-2 s^-1
-    radiosity_residual::Float64
-    particle_balance_residual::Float64
-    exchange_closure_error::Float64
-    gas::Gas
-    options::SolverOptions
-end
-
-number_density(result::FlowResult) = result.density
 
 function _signed_area(p)
     # Shoelace sign establishes polygon orientation in the (z,r) plane.
