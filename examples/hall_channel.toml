@@ -36,6 +36,9 @@ max_area = 2.5e-5
 max_boundary_length = 5.0e-3
 min_angle = 20.0
 azimuthal_divisions = 64
+# Set a positive tolerance to double azimuthal_divisions until converged.
+azimuthal_tolerance = 0.0
+max_azimuthal_divisions = 256
 radiosity_tolerance = 1.0e-10
 visibility_tolerance = 1.0e-10
 max_mesh_points = 200000

@@ -22,6 +22,8 @@ const XENON = Gas(131.293;unit=:amu)
         [(0.0,-0.1),(1.0,0.0),(0.0,1.0)],fill("x",3))
     @test_throws ArgumentError FreeMolecularFlow._validate_options(
         SolverOptions(max_boundary_length=-1.0))
+    @test_throws ArgumentError FreeMolecularFlow._validate_options(
+        SolverOptions(azimuthal_tolerance=-1.0))
 end
 
 @testset "independent boundary resolution" begin
@@ -93,14 +95,31 @@ end
     prepared = prepare(geometry,boundaries;options=QUICK)
     @test size(prepared.direction_moments,1) == 2
     base = solve(prepared,XENON)
+    @test base.labels == prepared.field_cache.labels
+    @test base.direct_view_factors == prepared.field_cache.direct_view_factors
+    @test base.direct_view_factors !== prepared.field_cache.direct_view_factors
     doubled_boundaries = Dict("axis"=>Axis(),
                               "reservoir"=>BackPressure(0.02,300.0))
     doubled = solve(prepared,doubled_boundaries,XENON)
-    @test doubled.evaluator.bvh === prepared.bvh
+    @test doubled.evaluator.patches === prepared.patches
     @test doubled.density ≈ 2 .* base.density rtol=5e-14
     @test doubled.velocity ≈ base.velocity rtol=5e-14 atol=1e-12
     @test_throws ArgumentError solve(prepared,
         Dict("axis"=>Axis()),XENON)
+
+    adaptive_options = SolverOptions(
+        max_area=1e-3,max_boundary_length=0.05,
+        azimuthal_divisions=4,azimuthal_tolerance=1e6,
+        max_azimuthal_divisions=8)
+    adaptive = prepare(geometry,boundaries;options=adaptive_options)
+    adaptive_result = solve(adaptive,XENON)
+    @test adaptive.azimuthal_divisions == 8
+    @test adaptive.azimuthal_convergence_error <= adaptive_options.azimuthal_tolerance
+    @test adaptive_result.evaluator.azimuthal_divisions == 8
+    @test_throws ErrorException prepare(geometry,boundaries;options=SolverOptions(
+        max_area=1e-3,max_boundary_length=0.05,
+        azimuthal_divisions=4,azimuthal_tolerance=eps(),
+        max_azimuthal_divisions=8))
 end
 
 @testset "optimized field quadrature" begin
@@ -151,13 +170,80 @@ end
     @test odd_weight == 1.0
 end
 
+@testset "analytic axisymmetric visibility" begin
+    geometry = box_geometry()
+    occluder = FreeMolecularFlow._build_occluder(geometry)
+    tol = 1e-10
+    # Radial and axial rays hit the exact cylinder and end disk respectively.
+    @test FreeMolecularFlow._occluded(
+        occluder,(0.05,0.0,0.0),(0.05,0.1,0.0),0,0,tol)
+    @test FreeMolecularFlow._occluded(
+        occluder,(0.05,0.025,0.0),(0.15,0.025,0.0),0,0,tol)
+    @test !FreeMolecularFlow._occluded(
+        occluder,(0.05,0.0,0.0),(0.05,0.04,0.0),0,0,tol)
+
+    # A finite cone r=0.5z is crossed at r=0.025 on the z=0.05 plane.
+    cone = FreeMolecularFlow.RevolvedSurface(
+        FreeMolecularFlow.CONICAL_SURFACE,0.0,0.0,0.5,
+        0.0,0.1,0.0,0.05,(0.0,-0.05,-0.05),(0.1,0.05,0.05))
+    crossing = FreeMolecularFlow._ray_segment(
+        (0.05,0.0,0.0),(0.05,0.05,0.0))
+    @test FreeMolecularFlow._hits_cone(cone,crossing,tol)
+
+    boundaries = Dict("axis"=>Axis(),"right"=>BackPressure(0.0,300.0),
+                      "top"=>DiffuseWall(400.0),"left"=>Inflow(1e-6,500.0))
+    prepared = prepare(geometry,boundaries;options=QUICK)
+    @test length(prepared.occluder.surfaces) == 3
+    @test length(prepared.occluder.surfaces) < length(prepared.patches)
+end
+
+@testset "prepared solver disk cache" begin
+    mktempdir() do dir
+        geometry = box_geometry(["axis","reservoir","reservoir","reservoir"])
+        boundaries = Dict("axis"=>Axis(),
+                          "reservoir"=>BackPressure(0.01,300.0))
+        path = joinpath(dir,"box.fmf-cache")
+        prepared = prepare_cached(path,geometry,boundaries;options=QUICK)
+        @test isfile(path)
+        loaded = load_prepared(path,geometry;options=QUICK)
+        @test loaded.exchange_matrix == prepared.exchange_matrix
+        @test solve(loaded,XENON).density ≈ solve(prepared,XENON).density
+
+        changed = SolverOptions(
+            max_area=QUICK.max_area,min_angle=QUICK.min_angle,
+            azimuthal_divisions=QUICK.azimuthal_divisions,
+            max_boundary_length=0.025)
+        rebuilt = prepare_cached(path,geometry,boundaries;options=changed)
+        @test rebuilt.options.max_boundary_length == 0.025
+        @test load_prepared(path).options.max_boundary_length == 0.025
+        @test_throws ArgumentError load_prepared(path,geometry;options=QUICK)
+
+        corrupt = joinpath(dir,"corrupt.fmf-cache")
+        write(corrupt,"not a cache")
+        @test_throws ArgumentError load_prepared(corrupt)
+    end
+end
+
 @testset "configuration and VTK" begin
     mktempdir() do dir
         config = joinpath(@__DIR__,"..","examples","hall_channel.toml")
         loaded = load_config(config)
         @test loaded.gas.molecular_mass ≈ XENON.molecular_mass
         @test loaded.boundaries["anode"] isa Inflow
+        @test loaded.cache === nothing
         @test loaded.options.max_boundary_length == 5e-3
+        @test loaded.options.azimuthal_tolerance == 0.0
+        @test loaded.options.max_azimuthal_divisions == 256
+        annotated = load_config(joinpath(
+            @__DIR__,"..","examples","annotated_options.toml"))
+        @test annotated.cache == "annotated_options.fmf-cache"
+        @test length(annotated.extraction_lines) == 2
+        @test Set(keys(annotated.boundaries)) ==
+              Set(["axis","farfield","outer_wall","exit_lip","channel_wall","inlet"])
+        cached_config = joinpath(dir,"cached.toml")
+        write(cached_config,read(config,String) *
+              "\n[cache]\npath = \"prepared.fmf-cache\"\n")
+        @test load_config(cached_config).cache == "prepared.fmf-cache"
 
         geometry = box_geometry(["axis","reservoir","reservoir","reservoir"])
         result = solve(geometry,
@@ -170,6 +256,7 @@ end
         @test occursin("velocity",xml)
         @test occursin("direct_view_factor_reservoir",xml)
         @test occursin("density_from_reservoir",xml)
+        @test occursin("azimuthal_divisions",xml)
 
         line = ExtractionLine("crossing",
             [(-0.01,0.025),(0.11,0.025)];num_points=5,method=:cell,

@@ -39,6 +39,9 @@ function write_vtk(filename::AbstractString, result::FlowResult)
         vtk["radiosity_residual",VTKFieldData()] = [result.radiosity_residual]
         vtk["particle_balance_residual",VTKFieldData()] = [result.particle_balance_residual]
         vtk["exchange_closure_error",VTKFieldData()] = [result.exchange_closure_error]
+        vtk["azimuthal_divisions",VTKFieldData()] = [result.azimuthal_divisions]
+        vtk["azimuthal_convergence_error",VTKFieldData()] =
+            [result.azimuthal_convergence_error]
     end
     only(files)
 end
@@ -221,9 +224,9 @@ function write_extraction_line(filename::AbstractString, result::FlowResult,
         evaluator === nothing && (evaluator = result.evaluator)
         points = [samples[i].point for i in inside_indices]
         _,direct,contributions,density,velocity = _evaluate_fields(
-            result.mesh,points,evaluator.bvh.patches,evaluator.bvh,
+            result.mesh,points,evaluator.patches,evaluator.occluder,
             result.boundary_flux,result.gas,evaluator.tol;
-            ntheta=result.options.azimuthal_divisions,
+            ntheta=evaluator.azimuthal_divisions,
             reporter,phase=:line_extraction,
             closure=result.exchange_closure_error,
             radiosity=result.radiosity_residual)
@@ -325,10 +328,15 @@ function load_config(path::AbstractString)
         max_boundary_length=Float64(get(opt,"max_boundary_length",0.0)),
         min_angle=Float64(get(opt,"min_angle",20.0)),
         azimuthal_divisions=Int(get(opt,"azimuthal_divisions",64)),
+        azimuthal_tolerance=Float64(get(opt,"azimuthal_tolerance",0.0)),
+        max_azimuthal_divisions=Int(get(opt,"max_azimuthal_divisions",256)),
         radiosity_tolerance=Float64(get(opt,"radiosity_tolerance",1e-10)),
         visibility_tolerance=Float64(get(opt,"visibility_tolerance",1e-10)),
         max_mesh_points=Int(get(opt,"max_mesh_points",200_000)))
     output = String(get(get(cfg,"output",Dict{String,Any}()),"path","free_molecular_flow.vtu"))
+    cache_table = get(cfg,"cache",nothing)
+    cache = cache_table === nothing ? nothing :
+            String(_required(cache_table,"path","cache"))
     # TOML [[extraction_lines]] entries arrive as a vector of dictionaries.
     # Named coordinate tables avoid the easy-to-miss positional [z,r] ordering.
     extraction_lines = ExtractionLine[]
@@ -351,7 +359,7 @@ function load_config(path::AbstractString)
     filenames = getfield.(extraction_lines,:filename)
     length(unique(filenames)) == length(filenames) ||
         throw(ArgumentError("extraction-line filenames must be unique"))
-    (;geometry,boundaries,gas,options,output,extraction_lines)
+    (;geometry,boundaries,gas,options,output,cache,extraction_lines)
 end
 
 """Run a TOML configuration and write its VTK output."""
@@ -359,8 +367,15 @@ function run_config(path::AbstractString; status_interval::Real=0.0,
                     status_io::IO=stdout)
     config = load_config(path)
     reporter = _make_reporter(status_interval,status_io,nothing)
-    result = solve(config.geometry,config.boundaries,config.gas;
-                   options=config.options,status_reporter=reporter)
+    cache_path = config.cache === nothing ? nothing : _case_path(path,config.cache)
+    result = if cache_path === nothing
+        solve(config.geometry,config.boundaries,config.gas;
+              options=config.options,status_reporter=reporter)
+    else
+        prepared = prepare_cached(cache_path,config.geometry,config.boundaries;
+                                  options=config.options,status_reporter=reporter)
+        solve(prepared,config.boundaries,config.gas;status_reporter=reporter)
+    end
     # All relative outputs are case-relative, not process-working-directory
     # relative. A case can therefore be launched reliably from any directory.
     output = _case_path(path,config.output)
@@ -382,6 +397,10 @@ function run_config(path::AbstractString; status_interval::Real=0.0,
     @printf("radiosity residual: %.6e\n",result.radiosity_residual)
     @printf("particle balance residual: %.6e\n",result.particle_balance_residual)
     @printf("exchange closure error: %.6e\n",result.exchange_closure_error)
+    @printf("azimuthal divisions: %d\n",result.azimuthal_divisions)
+    isfinite(result.azimuthal_convergence_error) && @printf(
+        "azimuthal convergence error: %.6e\n",result.azimuthal_convergence_error)
+    cache_path === nothing || println("cache: $cache_path")
     println("wrote: $written")
     for file in extraction_files
         println("wrote: $file")

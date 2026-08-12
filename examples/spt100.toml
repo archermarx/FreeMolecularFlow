@@ -60,6 +60,9 @@ radiosity_tolerance = 1.0e-10
 visibility_tolerance = 1.0e-10
 max_mesh_points = 200000
 
+[cache]
+path = "spt100.fmf-cache"
+
 [output]
 path = "spt100.vtu"
 

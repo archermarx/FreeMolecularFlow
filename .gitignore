@@ -2,3 +2,4 @@
 *.pvd
 *.vtm
 coverage/
+*.fmf-cache

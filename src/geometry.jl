@@ -11,6 +11,20 @@ function _validate_options(options::SolverOptions)
         throw(ArgumentError("max_boundary_length must be finite and nonnegative (zero selects an automatic value)"))
     0 < options.min_angle < 34 || throw(ArgumentError("min_angle must lie in (0,34) degrees"))
     options.azimuthal_divisions >= 4 || throw(ArgumentError("azimuthal_divisions must be at least 4"))
+    isfinite(options.azimuthal_tolerance) && options.azimuthal_tolerance >= 0 ||
+        throw(ArgumentError("azimuthal_tolerance must be finite and nonnegative"))
+    options.max_azimuthal_divisions >= 4 ||
+        throw(ArgumentError("max_azimuthal_divisions must be at least 4"))
+    if options.azimuthal_tolerance > 0
+        iseven(options.azimuthal_divisions) || throw(ArgumentError(
+            "adaptive azimuthal quadrature requires an even azimuthal_divisions value"))
+        iseven(options.max_azimuthal_divisions) || throw(ArgumentError(
+            "adaptive azimuthal quadrature requires an even max_azimuthal_divisions value"))
+        options.max_azimuthal_divisions >= options.azimuthal_divisions || throw(ArgumentError(
+            "max_azimuthal_divisions must not be less than azimuthal_divisions"))
+        options.max_azimuthal_divisions > options.azimuthal_divisions || throw(ArgumentError(
+            "adaptive azimuthal quadrature requires max_azimuthal_divisions > azimuthal_divisions"))
+    end
     options.radiosity_tolerance > 0 || throw(ArgumentError("radiosity_tolerance must be positive"))
     options.visibility_tolerance > 0 || throw(ArgumentError("visibility_tolerance must be positive"))
     options.max_mesh_points >= 3 || throw(ArgumentError("max_mesh_points must be at least 3"))

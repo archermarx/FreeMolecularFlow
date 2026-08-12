@@ -1,0 +1,183 @@
+# Annotated FreeMolecularFlow.jl input
+# ===================================
+#
+# Run this case from the repository root with:
+#
+#   julia --threads=auto --project=. bin/free_molecular_flow.jl \
+#       --status-interval 2 examples/annotated_options.toml
+#
+# All physical quantities use SI units unless a comment says otherwise:
+# metres, kilograms, seconds, pascals, and kelvin. Relative output, cache, and
+# CSV paths are resolved relative to this TOML file, not the launch directory.
+# The status interval is a command-line setting and is intentionally not stored
+# in the case file.
+
+[gas]
+# Specify the mass of one molecule in either atomic mass units (amu) or kg.
+# Use exactly one form. This example uses xenon.
+molecular_mass_amu = 131.293
+# molecular_mass_kg = 2.1801714e-25
+
+[geometry]
+# The gas domain is a single closed polygon in the meridional (z,r) plane.
+# Each point is [axial coordinate z, radius r], in metres. Consecutive points
+# form polygon edges, and the last point connects back to the first.
+#
+# This stepped profile represents a short channel opening into a wider plume
+# domain. Revolving its edges about r=0 produces only the cylinders, disks, and
+# cones handled by the analytic visibility accelerator. Curved walls can be
+# approximated with additional straight segments.
+#
+# Clockwise input is accepted and normalized, but counter-clockwise order makes
+# the edge-to-label mapping easier to inspect. The polygon must be simple, have
+# no holes or disconnected regions, and all radii must be nonnegative.
+points = [
+  [0.000, 0.000], # channel inlet on the symmetry axis
+  [0.080, 0.000], # downstream end of the axis
+  [0.080, 0.050], # outer corner of the far-field opening
+  [0.020, 0.050], # outer plume-facing wall
+  [0.020, 0.035], # channel-exit lip
+  [0.000, 0.035], # outer corner of the channel inlet
+]
+
+# There must be exactly one label per point. Label i belongs to the edge from
+# point i to point i+1, with cyclic indexing. A label may be reused on several
+# edges when they share one boundary condition.
+edge_labels = [
+  "axis",       # (0.000,0.000) -> (0.080,0.000)
+  "farfield",   # (0.080,0.000) -> (0.080,0.050)
+  "outer_wall", # (0.080,0.050) -> (0.020,0.050)
+  "exit_lip",   # (0.020,0.050) -> (0.020,0.035)
+  "channel_wall", # (0.020,0.035) -> (0.000,0.035)
+  "inlet",      # (0.000,0.035) -> (0.000,0.000)
+]
+
+# Every label used above needs one matching [boundaries.<label>] table.
+
+[boundaries.axis]
+# Axis is a zero-area symmetry edge, not a physical surface. It may only label
+# an edge lying entirely on r=0.
+type = "axis"
+
+[boundaries.inlet]
+# The mass flow rate is the total for all revolved edges carrying this label,
+# rather than a local mass flux. The source is a cosine-law half-Maxwellian.
+type = "inflow"
+mass_flow_rate = 2.0e-6 # kg/s (2 mg/s)
+temperature = 600.0     # K
+
+[boundaries.farfield]
+# An open boundary exchanges gas with a stationary Maxwellian reservoir.
+# Set pressure=0 for a perfect-vacuum outlet. The nonzero value below is
+# approximately 5e-6 Torr, converted to pascals.
+type = "back_pressure"
+pressure = 6.6661184e-4 # Pa
+temperature = 100.0     # K
+
+[boundaries.channel_wall]
+# Diffuse walls fully accommodate incoming molecules and re-emit them with a
+# cosine distribution at the specified wall temperature, conserving particles.
+type = "diffuse_wall"
+temperature = 773.15 # K (500 degC)
+
+[boundaries.outer_wall]
+type = "diffuse_wall"
+temperature = 650.0 # K; labels may give separate surfaces different values
+
+[boundaries.exit_lip]
+type = "diffuse_wall"
+temperature = 700.0 # K
+
+# Specular and partially accommodating reflection are not currently
+# implemented; declaring type="specular" produces an explicit error.
+
+[solver]
+# Maximum triangle area in the R-Z output mesh [m^2]. Smaller values produce
+# more VTK cells and more cell-center evaluations. Zero selects an automatic
+# value equal to one two-hundredth of the polygon area.
+max_area = 2.5e-5
+
+# Maximum length [m] of a boundary segment used by the transport solve.
+# This is independent of max_area, so volume-mesh convergence can be studied
+# without also growing the (more expensive) boundary exchange matrix. Zero
+# chooses twice the characteristic cell length.
+max_boundary_length = 1.0e-2
+
+# Constrained-Delaunay mesh quality target in degrees.
+min_angle = 20.0
+
+# Number of azimuthal divisions used to revolve each boundary segment. Higher
+# values resolve azimuthal visibility more accurately but cost more. Even
+# values enable the solver's mirrored-ring optimization.
+azimuthal_divisions = 16
+
+# Zero selects fixed azimuthal resolution. To enable adaptive resolution, use
+# a positive relative tolerance (for example 5.0e-2); the solver repeatedly
+# doubles azimuthal_divisions until its exchange and field moments converge.
+azimuthal_tolerance = 0.0
+max_azimuthal_divisions = 128 # adaptive cost guard; must also be even
+
+# Numerical tolerances for the diffuse-wall radiosity solve and analytic ray
+# intersection tests. Defaults are usually appropriate; expose them mainly for
+# demanding scale ranges or diagnostic studies.
+radiosity_tolerance = 1.0e-10
+visibility_tolerance = 1.0e-10
+
+# Hard guard against an accidentally over-refined R-Z mesh.
+max_mesh_points = 200000
+
+[cache]
+# Cache geometry-dependent preprocessing (mesh, visibility structures,
+# exchange matrix, and cell moments). The cache is reused on later runs and is
+# rebuilt automatically when geometry or relevant solver options change.
+path = "annotated_options.fmf-cache"
+
+[output]
+# The VTU contains cell-centered number density, gas velocity, direct view
+# factors for each physical boundary label, density contributions by label,
+# and global convergence/conservation diagnostics.
+path = "annotated_options.vtu"
+
+[[extraction_lines]]
+# A straight profile evaluated at the exact requested coordinates. Direct
+# evaluation is the most accurate option, but it performs additional ray
+# tracing and is therefore slower than cell sampling.
+name = "channel_centerline"
+points = [
+  { z = 0.002, r = 0.0175 },
+  { z = 0.075, r = 0.0175 },
+]
+num_points = 25 # includes both endpoints; use exactly one sampling control
+method = "direct"
+
+# keep: write outside points with empty solution columns
+# drop: omit outside points
+# error: stop if any requested point lies outside the gas polygon
+outside_domain = "error"
+
+# Available field groups are number_density, velocity, view_factors, and
+# density_contributions. Omitting fields writes all four groups.
+fields = [
+  "number_density",
+  "velocity",
+  "view_factors",
+  "density_contributions",
+]
+filename = "annotated_centerline.csv"
+
+[[extraction_lines]]
+# Three or more control points define a piecewise-linear path. `spacing` is an
+# alternative to num_points: samples are approximately this far apart in path
+# distance, and the final control point is always included. Cell mode simply
+# copies the containing triangle's result and is inexpensive for many samples.
+name = "bent_plume_profile"
+points = [
+  { z = 0.005, r = 0.030 },
+  { z = 0.040, r = 0.030 },
+  { z = 0.070, r = 0.045 },
+]
+spacing = 0.005 # m; mutually exclusive with num_points
+method = "cell"
+outside_domain = "error"
+fields = ["number_density", "velocity"]
+filename = "annotated_bent_profile.csv"

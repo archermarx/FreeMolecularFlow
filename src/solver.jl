@@ -4,21 +4,44 @@ parameter sweeps. Construct with [`prepare`](@ref), then call `solve` one or
 more times without rebuilding the mesh, surface quadrature, BVH, or exchange
 matrix, or repeating cell-to-surface visibility queries.
 """
+struct RadiositySystem
+    diffuse_mask::BitVector
+    diffuse::Vector{Int}
+    prescribed::Vector{Int}
+    matrix::Matrix{Float64}
+    prescribed_coupling::Matrix{Float64}
+    factorization::Union{Nothing,LU{Float64,Matrix{Float64},Vector{Int}}}
+end
+
+struct FieldAssemblyCache
+    labels::Vector{String}
+    segment_labels::Vector{Int}
+    direct_view_factors::Dict{String,Vector{Float64}}
+    label_areas::Dict{String,Float64}
+end
+
 struct PreparedSolver
     geometry::AxisymmetricGeometry
     mesh::RZMesh
-    bvh::PatchBVH
+    patches::Vector{SurfacePatch}
+    occluder::AnalyticOccluder
     exchange_matrix::Matrix{Float64}
     exchange_closure_error::Float64
     solid_angles::Matrix{Float64}
     direction_moments::Array{Float64,3}
+    radiosity_system::RadiositySystem
+    field_cache::FieldAssemblyCache
+    azimuthal_divisions::Int
+    azimuthal_convergence_error::Float64
     visibility_tolerance::Float64
     options::SolverOptions
 end
 
 struct DirectEvaluator
-    bvh::PatchBVH
+    patches::Vector{SurfacePatch}
+    occluder::AnalyticOccluder
     tol::Float64
+    azimuthal_divisions::Int
 end
 
 """
@@ -41,9 +64,20 @@ struct FlowResult
     radiosity_residual::Float64
     particle_balance_residual::Float64
     exchange_closure_error::Float64
+    azimuthal_divisions::Int
+    azimuthal_convergence_error::Float64
     gas::Gas
     options::SolverOptions
     evaluator::DirectEvaluator
+end
+
+struct GeometricTransport
+    patches::Vector{SurfacePatch}
+    occluder::AnalyticOccluder
+    exchange_matrix::Matrix{Float64}
+    exchange_closure_error::Float64
+    solid_angles::Matrix{Float64}
+    direction_moments::Array{Float64,3}
 end
 
 number_density(result::FlowResult) = result.density
@@ -67,51 +101,71 @@ end
 
 _prescribed_flux(::DiffuseWall,gas,label_area) = 0.0
 
-function _prescribed_fluxes(mesh::RZMesh, gas::Gas)
+function _label_areas(mesh::RZMesh)
+    areas = Dict{String,Float64}()
+    for segment in mesh.boundary_segments
+        areas[segment.label] = get(areas,segment.label,0.0) + segment.area
+    end
+    areas
+end
+
+function _prescribed_fluxes(mesh::RZMesh,gas::Gas,label_areas=_label_areas(mesh))
     # q_j is the outward emission number flux from boundary segment j
     # [particles m⁻² s⁻¹]. Diffuse-wall entries remain zero here because their
     # emission is the unknown solved by `_solve_radiosity`.
     q = zeros(length(mesh.boundary_segments))
-    label_areas = Dict{String,Float64}()
-    for s in mesh.boundary_segments
-        label_areas[s.label] = get(label_areas,s.label,0.0) + s.area
-    end
     for (i,segment) in pairs(mesh.boundary_segments)
         q[i] = _prescribed_flux(segment.condition,gas,label_areas[segment.label])
     end
     q
 end
 
-function _solve_radiosity(mesh::RZMesh, H, gas::Gas, tolerance)
+function _prepare_radiosity_system(mesh::RZMesh,H,tolerance)
     segments = mesh.boundary_segments
-    diffuse = findall(_is_diffuse,segments)
-    prescribed = findall(s -> !_is_diffuse(s),segments)
-    isempty(prescribed) && throw(ArgumentError(
-        "a domain containing only diffuse walls has no unique steady density; add an inflow or back-pressure opening"))
-    q = _prescribed_fluxes(mesh,gas)
-    isempty(diffuse) && return q, 0.0
+    mask = BitVector(_is_diffuse.(segments))
+    diffuse, prescribed = findall(mask), findall(.!mask)
+    isempty(prescribed) && return RadiositySystem(
+        mask,diffuse,prescribed,zeros(0,0),zeros(0,0),nothing)
+    isempty(diffuse) && return RadiositySystem(
+        mask,diffuse,prescribed,zeros(0,0),zeros(0,length(prescribed)),nothing)
     # A diffuse wall emits exactly what it receives:
     #   q_D = H_DD q_D + H_DP q_P.
     # Rearranging gives one dense, deterministic linear radiosity solve.
     M = Matrix(I,length(diffuse),length(diffuse)) - H[diffuse,diffuse]
-    rhs = H[diffuse,prescribed] * q[prescribed]
     # A perfectly closed diffuse enclosure has eigenvalue one in H_DD, so its
     # absolute density is arbitrary. Detect that physical non-uniqueness before
     # relying on a numerically unstable factorization.
     kappa = cond(M)
     (!isfinite(kappa) || kappa > inv(tolerance)) && throw(ArgumentError(
         "diffuse-wall radiosity system is singular or ill-conditioned; ensure the domain has a finite-area escape opening"))
-    qd = M \ rhs
+    RadiositySystem(mask,diffuse,prescribed,M,H[diffuse,prescribed],lu(M))
+end
+
+function _solve_radiosity(mesh::RZMesh,gas::Gas,tolerance,
+                          system::RadiositySystem,
+                          label_areas=_label_areas(mesh))
+    isempty(system.prescribed) && throw(ArgumentError(
+        "a domain containing only diffuse walls has no unique steady density; add an inflow or back-pressure opening"))
+    q = _prescribed_fluxes(mesh,gas,label_areas)
+    isempty(system.diffuse) && return q, 0.0
+    M = system.matrix
+    rhs = system.prescribed_coupling * q[system.prescribed]
+    qd = system.factorization \ rhs
     scale = max(maximum(abs,qd; init=0.0),maximum(abs,q; init=0.0),1.0)
     # Roundoff may create tiny negative values, but a materially negative
     # outward wall flux violates particle conservation and indicates failure.
     minimum(qd; init=0.0) < -100eps(Float64)*scale &&
         throw(ErrorException("radiosity solve produced a negative wall flux"))
-    q[diffuse] = max.(qd,0.0)
-    residual = norm(M*q[diffuse]-rhs) / max(norm(rhs),1.0)
+    q[system.diffuse] = max.(qd,0.0)
+    residual = norm(M*q[system.diffuse]-rhs) / max(norm(rhs),1.0)
     residual <= 10tolerance || throw(ErrorException(
         "diffuse-wall solve did not converge: relative residual $residual"))
     q, residual
+end
+
+function _solve_radiosity(mesh::RZMesh,H,gas::Gas,tolerance)
+    system = _prepare_radiosity_system(mesh,H,tolerance)
+    _solve_radiosity(mesh,gas,tolerance,system)
 end
 
 function _field_patch_quadrature(patches,ntheta)
@@ -156,7 +210,8 @@ function _geometric_field_moments(mesh::RZMesh,sample_points,patches,bvh,tol;
             _dot(ray,ray) > tolerance_squared || continue
             # Normalization cannot change the sign of the facing test.
             _dot(patch.normal,ray) > 0 || continue
-            _occluded(bvh,patch.center,point,ip,0,tol,traversal_stack) && continue
+            _occluded(bvh,patch.surface_center,point,ip,0,tol,
+                      traversal_stack) && continue
             omega,vector_omega = _solid_angle_moments(point,patch)
             scale = quadrature_weight*patch.area_scale
             omega *= scale
@@ -178,12 +233,24 @@ function _geometric_field_moments(mesh::RZMesh,sample_points,patches,bvh,tol;
     solid_angles,direction_moments
 end
 
-function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas)
+function _field_assembly_cache(mesh::RZMesh,solid_angles)
     labels = sort(unique(s.label for s in mesh.boundary_segments))
     count = size(solid_angles,2)
     label_index = Dict(label=>i for (i,label) in pairs(labels))
     segment_label = [label_index[s.label] for s in mesh.boundary_segments]
     direct_values = zeros(length(labels),count)
+    for ic in 1:count, iseg in eachindex(mesh.boundary_segments)
+        direct_values[segment_label[iseg],ic] += solid_angles[iseg,ic]/(4pi)
+    end
+    direct = Dict(label=>collect(@view direct_values[i,:])
+                  for (i,label) in pairs(labels))
+    FieldAssemblyCache(labels,segment_label,direct,_label_areas(mesh))
+end
+
+function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas,
+                          cache=_field_assembly_cache(mesh,solid_angles))
+    labels = cache.labels
+    count = size(solid_angles,2)
     contribution_values = zeros(length(labels),count)
     momentum = zeros(3,count)
     density = zeros(count)
@@ -194,10 +261,7 @@ function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas)
     for ic in 1:count, iseg in eachindex(mesh.boundary_segments)
         omega = solid_angles[iseg,ic]
         omega > 0 || continue
-        ilabel = segment_label[iseg]
-        # Katz's direct view factor is the visible solid-angle fraction of the
-        # full sphere and therefore needs no gas-dependent weighting.
-        direct_values[ilabel,ic] += omega/(4pi)
+        ilabel = cache.segment_labels[iseg]
         # For cosine-law Maxwellian emission, q = n_source*c̄/4 and the local
         # density contribution is q*Ω/(π*c̄).
         dn = density_weights[iseg]*omega
@@ -215,13 +279,15 @@ function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas)
             momentum[2,ic] = 0.0
         end
     end
-    # Dictionaries remain the public label-oriented representation, but are
-    # constructed only after the hot loop has finished.
-    direct = Dict(label=>collect(@view direct_values[i,:])
-                  for (i,label) in pairs(labels))
+    # Convert dense per-label contributions to the public dictionary form only
+    # after the numerical loop.
     contribution = Dict(label=>collect(@view contribution_values[i,:])
                         for (i,label) in pairs(labels))
-    labels,direct,contribution,density,momentum
+    # Results own their mutable arrays; callers cannot corrupt PreparedSolver's
+    # cached geometry by modifying a previous FlowResult.
+    direct = Dict(label=>copy(values)
+                  for (label,values) in cache.direct_view_factors)
+    copy(labels),direct,contribution,density,momentum
 end
 
 function _evaluate_fields(mesh::RZMesh,sample_points,patches,bvh,q,gas,tol;
@@ -250,6 +316,60 @@ function _make_reporter(status_interval,status_io,status_reporter)
         StatusReporter(status_interval,status_io) : status_reporter
 end
 
+function _geometric_transport(geometry,mesh,nazimuth,tol,reporter)
+    _status!(reporter,:surface_quadrature,0;force=true)
+    patches = _revolve_segments(mesh.boundary_segments,nazimuth)
+    occluder = _build_occluder(geometry)
+    _status!(reporter,:surface_quadrature,length(patches);
+             total=length(patches),force=true)
+    H,closure = _boundary_exchange(
+        mesh,patches,occluder,tol,nazimuth,reporter)
+    solid_angles,direction_moments = _geometric_field_moments(
+        mesh,mesh.centers,patches,occluder,tol;
+        ntheta=nazimuth,reporter,closure,phase=:field_precompute)
+    GeometricTransport(patches,occluder,H,closure,solid_angles,direction_moments)
+end
+
+function _relative_change(current,previous)
+    difference_scale = 0.0
+    value_scale = eps(Float64)
+    for i in eachindex(current,previous)
+        difference_scale = max(difference_scale,abs(current[i]-previous[i]))
+        value_scale = max(value_scale,abs(current[i]),abs(previous[i]))
+    end
+    difference_scale/value_scale
+end
+
+function _transport_change(current::GeometricTransport,previous::GeometricTransport)
+    max(_relative_change(current.exchange_matrix,previous.exchange_matrix),
+        _relative_change(current.solid_angles,previous.solid_angles),
+        _relative_change(current.direction_moments,previous.direction_moments))
+end
+
+function _converged_transport(geometry,mesh,options,tol,reporter)
+    divisions = options.azimuthal_divisions
+    transport = _geometric_transport(geometry,mesh,divisions,tol,reporter)
+    options.azimuthal_tolerance == 0 && return transport,divisions,NaN
+
+    error = Inf
+    while divisions < options.max_azimuthal_divisions
+        next_divisions = min(2divisions,options.max_azimuthal_divisions)
+        candidate = _geometric_transport(
+            geometry,mesh,next_divisions,tol,reporter)
+        error = _transport_change(candidate,transport)
+        _status!(reporter,:azimuthal_convergence,next_divisions;
+                 total=options.max_azimuthal_divisions,
+                 exchange_closure=error,force=true)
+        error <= options.azimuthal_tolerance &&
+            return candidate,next_divisions,error
+        transport,divisions = candidate,next_divisions
+    end
+    throw(ErrorException(
+        "azimuthal quadrature did not reach tolerance $(options.azimuthal_tolerance) " *
+        "by max_azimuthal_divisions=$(options.max_azimuthal_divisions) " *
+        "(last relative change: $error)"))
+end
+
 """
     prepare(geometry, boundaries; options=SolverOptions(),
             status_interval=0, status_io=stdout) -> PreparedSolver
@@ -265,20 +385,19 @@ function prepare(geometry::AxisymmetricGeometry,boundaries;
     _status!(reporter,:mesh,0;force=true)
     mesh = _make_mesh(geometry,boundaries,options)
     _status!(reporter,:mesh,length(mesh.cells);total=length(mesh.cells),force=true)
-    _status!(reporter,:surface_quadrature,0;force=true)
-    patches = _revolve_segments(mesh.boundary_segments,options.azimuthal_divisions)
-    bvh = _build_bvh(patches)
-    _status!(reporter,:surface_quadrature,length(patches);total=length(patches),force=true)
     scale = maximum(abs,Iterators.flatten(geometry.points);init=1.0)
     tol = options.visibility_tolerance*max(scale,1.0)
-    H,closure = _boundary_exchange(mesh,patches,bvh,tol,
-                                   options.azimuthal_divisions,reporter)
-    solid_angles,direction_moments = _geometric_field_moments(
-        mesh,mesh.centers,patches,bvh,tol;
-        ntheta=options.azimuthal_divisions,reporter,closure,
-        phase=:field_precompute)
-    PreparedSolver(geometry,mesh,bvh,H,closure,solid_angles,
-                   direction_moments,tol,options)
+    transport,nazimuth,azimuthal_error = _converged_transport(
+        geometry,mesh,options,tol,reporter)
+    H,closure = transport.exchange_matrix,transport.exchange_closure_error
+    solid_angles = transport.solid_angles
+    direction_moments = transport.direction_moments
+    radiosity_system = _prepare_radiosity_system(
+        mesh,H,options.radiosity_tolerance)
+    field_cache = _field_assembly_cache(mesh,solid_angles)
+    PreparedSolver(geometry,mesh,transport.patches,transport.occluder,H,closure,solid_angles,
+                   direction_moments,radiosity_system,field_cache,nazimuth,
+                   azimuthal_error,tol,options)
 end
 
 function _mesh_with_boundaries(prepared::PreparedSolver,boundaries)
@@ -294,17 +413,29 @@ function _solve_prepared(prepared::PreparedSolver,mesh::RZMesh,gas::Gas,reporter
     H = prepared.exchange_matrix
     options = prepared.options
     _status!(reporter,:radiosity,0;exchange_closure=closure,force=true)
-    q,residual = _solve_radiosity(mesh,H,gas,options.radiosity_tolerance)
+    cached_system = prepared.radiosity_system
+    same_pattern = all(i -> cached_system.diffuse_mask[i] ==
+                            _is_diffuse(mesh.boundary_segments[i]),
+                       eachindex(mesh.boundary_segments))
+    system = same_pattern ? cached_system :
+             _prepare_radiosity_system(mesh,H,options.radiosity_tolerance)
+    q,residual = _solve_radiosity(
+        mesh,gas,options.radiosity_tolerance,system,
+        prepared.field_cache.label_areas)
     _status!(reporter,:radiosity,1;total=1,exchange_closure=closure,
              radiosity=residual,force=true)
     labels,direct,contributions,density,velocity = _assemble_fields(
-        mesh,prepared.solid_angles,prepared.direction_moments,q,gas)
+        mesh,prepared.solid_angles,prepared.direction_moments,q,gas,
+        prepared.field_cache)
     balance = _particle_balance(mesh,H,q)
     _status!(reporter,:complete,1;total=1,exchange_closure=closure,
              radiosity=residual,particle_balance=balance,force=true)
     FlowResult(mesh,labels,direct,contributions,density,velocity,q,
-               residual,balance,closure,gas,options,
-               DirectEvaluator(prepared.bvh,prepared.visibility_tolerance))
+               residual,balance,closure,prepared.azimuthal_divisions,
+               prepared.azimuthal_convergence_error,gas,options,
+               DirectEvaluator(prepared.patches,prepared.occluder,
+                               prepared.visibility_tolerance,
+                               prepared.azimuthal_divisions))
 end
 
 """Solve using the boundary conditions stored when `prepared` was constructed."""

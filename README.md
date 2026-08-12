@@ -43,6 +43,10 @@ test suite with:
 julia --project=. test/runtests.jl
 ```
 
+For a runnable input file with comments describing the main geometry,
+boundary, solver, cache, output, and line-extraction options, see
+[`examples/annotated_options.toml`](examples/annotated_options.toml).
+
 ## Julia API
 
 Geometry is one simple closed polygon in the `(z,r)` plane. Edge `i` joins
@@ -80,6 +84,25 @@ updated["anode"] = Inflow(7e-6, 700.0)
 result_2 = solve(prepared, updated, gas)
 ```
 
+Prepared data can also be reused across Julia processes:
+
+```julia
+prepared = prepare_cached("spt100.fmf-cache",geometry,boundaries;options)
+result = solve(prepared,boundaries,gas)
+```
+
+or directly from TOML:
+
+```toml
+[cache]
+path = "spt100.fmf-cache"
+```
+
+Relative cache paths are case-relative. A missing cache is built atomically;
+one whose geometry or solver options changed is rebuilt. Cache files are tied
+to the Julia and FreeMolecularFlow versions that wrote them, because Julia's
+native serialization format is not intended as a portable interchange format.
+
 The mesh, revolved surface, visibility hierarchy, boundary-exchange matrix, and
 cell solid-angle moments are reused. Replacement boundaries must use the same
 geometry labels, but their values and types may change.
@@ -107,10 +130,13 @@ fails with an explicit diagnostic rather than silently changing its physics.
 ## Numerical method
 
 The polygon is refined to a constrained Delaunay triangle mesh. Every physical
-boundary segment is revolved into triangular surface patches. Direct solid
-angles use the Oosterom–Strackee formula; a bounding-volume hierarchy removes
-occluded rays. Axisymmetry reduces boundary exchange integration to one
-receiver wedge and a full ring of emitters.
+boundary segment is revolved into triangular solid-angle integration patches.
+Direct solid angles use the Oosterom–Strackee formula. Visibility rays are
+intersected analytically with the original edges revolved into finite cylinders,
+annular disks, and cones; a small hierarchy over those exact surfaces rejects
+distant geometry. Axisymmetry reduces boundary exchange integration to one
+receiver wedge and a full ring of emitters. Visibility cost therefore scales
+with the number of input polygon edges rather than the azimuthal patch count.
 
 The segment exchange matrix is symmetrized for reciprocity and balanced to
 satisfy enclosure closure. Prescribed source fluxes drive a linear diffuse
@@ -131,6 +157,25 @@ Even values of `azimuthal_divisions` are preferred: their mirrored surface
 quadrature lets field reconstruction evaluate half of each ring. Odd values
 remain supported and use the full ring.
 
+Azimuthal resolution can also be selected automatically. Set
+`azimuthal_tolerance` to a positive relative tolerance and use
+`azimuthal_divisions` as the starting resolution. The solver doubles that
+resolution until the exchange matrix, scalar solid angles, and directional
+moments all satisfy the tolerance, or throws when `max_azimuthal_divisions` is
+reached. Both limits must be even in adaptive mode. For example:
+
+```toml
+[solver]
+azimuthal_divisions = 16
+azimuthal_tolerance = 5.0e-2
+max_azimuthal_divisions = 128
+```
+
+The actual resolution and estimated change are available as
+`result.azimuthal_divisions` and `result.azimuthal_convergence_error`, and are
+also written as VTK field data. The default tolerance is zero, retaining fixed
+resolution and avoiding the cost of convergence comparisons.
+
 Field reconstruction uses every Julia worker thread made available at process
 startup. For example, run the command-line solver on the automatically selected
 thread count with:
@@ -150,8 +195,9 @@ The `.vtu` file contains triangle cell data:
 - `density_from_<label>` in m⁻³, the final density emitted by that label after
   diffuse-wall coupling.
 
-Field-data scalars record the three solver diagnostics. Labels are lowercased
-and sanitized for use as VTK array names.
+Field-data scalars record the three conservation/residual diagnostics plus the
+actual azimuthal resolution and its convergence estimate. Labels are
+lowercased and sanitized for use as VTK array names.
 
 ## Line extraction
 
