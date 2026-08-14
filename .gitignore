@@ -3,3 +3,4 @@
 *.vtm
 coverage/
 *.fmf-cache
+*.csv
