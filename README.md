@@ -141,7 +141,9 @@ with the number of input polygon edges rather than the azimuthal patch count.
 The segment exchange matrix is symmetrized for reciprocity and balanced to
 satisfy enclosure closure. Prescribed source fluxes drive a linear diffuse
 radiosity solve. Visible source distributions then give cell-centered number
-density and the exact vector solid-angle moment gives mean velocity. The
+density, mean velocity, and centered directional temperatures. Exact scalar,
+vector, and diagonal second solid-angle moments are evaluated over each visible
+spherical triangle, so temperature does not assume a local Maxwellian VDF. The
 `radiosity_residual`, `particle_balance_residual`, and
 `exchange_closure_error` fields on `FlowResult` should be inspected for every
 new geometry.
@@ -160,9 +162,10 @@ remain supported and use the full ring.
 Azimuthal resolution can also be selected automatically. Set
 `azimuthal_tolerance` to a positive relative tolerance and use
 `azimuthal_divisions` as the starting resolution. The solver doubles that
-resolution until the exchange matrix, scalar solid angles, and directional
-moments all satisfy the tolerance, or throws when `max_azimuthal_divisions` is
-reached. Both limits must be even in adaptive mode. For example:
+resolution until the exchange matrix and all scalar, first, and second
+directional moments satisfy the tolerance, or throws when
+`max_azimuthal_divisions` is reached. Both limits must be even in adaptive
+mode. For example:
 
 ```toml
 [solver]
@@ -190,6 +193,7 @@ The `.vtu` file contains triangle cell data:
 
 - `number_density` in m⁻³;
 - `velocity` in m/s, with components `(u_z,u_r,u_θ)`;
+- `temperature` in K, with centered second-moment components `(T_z,T_r,T_θ)`;
 - `direct_view_factor_<label>`, the unobstructed solid-angle fraction
   \(\Omega/(4\pi)\) for each physical boundary label;
 - `density_from_<label>` in m⁻³, the final density emitted by that label after
@@ -214,7 +218,7 @@ points = [
 num_points = 101
 method = "direct"
 outside_domain = "keep"
-fields = ["number_density", "velocity", "view_factors", "density_contributions"]
+fields = ["number_density", "velocity", "temperature", "view_factors", "density_contributions"]
 filename = "spt100_centerline.csv"
 ```
 
@@ -229,8 +233,9 @@ triangle's cell-centered result. `outside_domain` may be `"keep"`, `"drop"`, or
 
 The CSV always includes sample number, polyline segment, cumulative fraction
 and distance (metres), `(z,r)` coordinates (metres), domain membership, and
-containing cell index. The available solution-field groups are `number_density`, `velocity`, `view_factors`,
-and `density_contributions`. Omitting `fields` writes all groups. Omitting
+containing cell index. The available solution-field groups are `number_density`,
+`velocity`, `temperature`, `view_factors`, and `density_contributions`.
+Omitting `fields` writes all groups. Omitting
 `filename` derives `<name>.csv`; otherwise the path is resolved relative to the
 TOML file. Multiple `[[extraction_lines]]` blocks produce multiple CSV files.
 When CLI status output is enabled, direct extraction progress appears as an

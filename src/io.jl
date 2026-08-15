@@ -31,6 +31,7 @@ function write_vtk(filename::AbstractString, result::FlowResult)
     files = vtk_grid(root,points,cells) do vtk
         vtk["number_density",VTKCellData()] = result.density
         vtk["velocity",VTKCellData()] = result.velocity
+        vtk["temperature",VTKCellData()] = result.temperature
         for label in result.labels
             safe = names[label]
             vtk["direct_view_factor_$(safe)",VTKCellData()] = result.direct_view_factors[label]
@@ -156,6 +157,8 @@ function _extraction_columns(line::ExtractionLine, labels, names)
                "inside_domain","cell_index"]
     :number_density in line.fields && push!(columns,"number_density")
     :velocity in line.fields && append!(columns,["velocity_z","velocity_r","velocity_theta"])
+    :temperature in line.fields && append!(columns,
+        ["temperature_z","temperature_r","temperature_theta"])
     if :view_factors in line.fields
         append!(columns,["direct_view_factor_$(names[label])" for label in labels])
     end
@@ -172,6 +175,11 @@ function _write_extracted_values(io,line,labels,values,index)
     if :velocity in line.fields
         for component in 1:3
             print(io,','); _csv_value(io,values.velocity[component,index])
+        end
+    end
+    if :temperature in line.fields
+        for component in 1:3
+            print(io,','); _csv_value(io,values.temperature[component,index])
         end
     end
     if :view_factors in line.fields
@@ -213,6 +221,7 @@ function write_extraction_line(filename::AbstractString, result::FlowResult,
 
     inside_indices = findall(!=(0),cells)
     cell_values = (;density=result.density,velocity=result.velocity,
+                   temperature=result.temperature,
                    direct=result.direct_view_factors,
                    contributions=result.density_contributions)
     direct_values = nothing
@@ -223,14 +232,14 @@ function write_extraction_line(filename::AbstractString, result::FlowResult,
         # empty solution columns and never participate in expensive ray tracing.
         evaluator === nothing && (evaluator = result.evaluator)
         points = [samples[i].point for i in inside_indices]
-        _,direct,contributions,density,velocity = _evaluate_fields(
+        _,direct,contributions,density,velocity,temperature = _evaluate_fields(
             result.mesh,points,evaluator.patches,evaluator.occluder,
             result.boundary_flux,result.gas,evaluator.tol;
             ntheta=evaluator.azimuthal_divisions,
             reporter,phase=:line_extraction,
             closure=result.exchange_closure_error,
             radiosity=result.radiosity_residual)
-        direct_values = (;direct,contributions,density,velocity)
+        direct_values = (;direct,contributions,density,velocity,temperature)
         # Direct arrays are compacted to interior points, so map original path
         # sample indices back to their row in those arrays during CSV emission.
         direct_lookup[inside_indices] .= eachindex(inside_indices)

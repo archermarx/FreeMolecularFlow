@@ -468,8 +468,9 @@ function _solid_angle(point::Vec3, patch::SurfacePatch)
 end
 
 function _solid_angle_moments(point::Vec3, patch::SurfacePatch)
-    # This is deliberately fused: field reconstruction needs both moments, and
-    # sharing vertex rays and lengths is measurably faster in this hot loop.
+    # This is deliberately fused: field reconstruction needs the scalar, vector,
+    # and diagonal second moments, and sharing vertex rays and lengths is
+    # measurably faster in this hot loop.
     a,b,c = (_vsub(vertex,point) for vertex in _patch_vertices(patch))
     la,lb,lc = _norm(a),_norm(b),_norm(c)
     numerator = abs(_dot(a,_cross(b,c)))
@@ -478,19 +479,37 @@ function _solid_angle_moments(point::Vec3, patch::SurfacePatch)
 
     directions = (_vscale(a,inv(la)),_vscale(b,inv(lb)),_vscale(c,inv(lc)))
     vector_omega = (0.0,0.0,0.0)
-    for (u,v) in ((directions[1],directions[2]),
-                  (directions[2],directions[3]),
-                  (directions[3],directions[1]))
+    # On the unit sphere, Δ_s(s_i*s_j) = 2δ_ij - 6s_i*s_j. Applying the
+    # surface-divergence theorem converts the second solid-angle moment into
+    # exact great-circle edge integrals. Only the diagonal is retained because
+    # these are the three directional temperatures requested by the R-Z model.
+    second_omega = (omega/3,omega/3,omega/3)
+    for (u,v,w) in ((directions[1],directions[2],directions[3]),
+                    (directions[2],directions[3],directions[1]),
+                    (directions[3],directions[1],directions[2]))
         cross_uv = _cross(u,v)
         sine = _norm(cross_uv)
         sine <= 10eps(Float64) && continue
         angle = atan(sine,_dot(u,v))
         vector_omega = _vadd(
             vector_omega,_vscale(cross_uv,0.5*angle/sine))
+
+        # Choose the edge conormal that points into the spherical triangle.
+        inward = _vscale(cross_uv,inv(sine))
+        _dot(inward,w) < 0 && (inward = _vscale(inward,-1))
+        # Integral of the unit direction along the minor great-circle arc. This
+        # midpoint form remains stable when the edge angle approaches π.
+        midpoint = _vadd(u,v)
+        midpoint_norm = _norm(midpoint)
+        midpoint_norm <= 10eps(Float64) && continue
+        edge_integral = _vscale(
+            midpoint,2sin(angle/2)/midpoint_norm)
+        second_omega = ntuple(i ->
+            second_omega[i] + inward[i]*edge_integral[i]/3,3)
     end
     _dot(vector_omega,_vsub(patch.center,point)) < 0 &&
         (vector_omega = _vscale(vector_omega,-1))
-    omega,vector_omega
+    omega,vector_omega,second_omega
 end
 
 function _receiver_patches(patches,ns,ntheta)

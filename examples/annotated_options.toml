@@ -133,9 +133,10 @@ max_mesh_points = 200000
 path = "annotated_options.fmf-cache"
 
 [output]
-# The VTU contains cell-centered number density, gas velocity, direct view
-# factors for each physical boundary label, density contributions by label,
-# and global convergence/conservation diagnostics.
+# The VTU contains cell-centered number density, gas velocity, directional
+# temperature (T_z, T_r, T_theta), direct view factors for each physical
+# boundary label, density contributions by label, and global
+# convergence/conservation diagnostics.
 path = "annotated_options.vtu"
 
 [[extraction_lines]]
@@ -155,11 +156,12 @@ method = "direct"
 # error: stop if any requested point lies outside the gas polygon
 outside_domain = "error"
 
-# Available field groups are number_density, velocity, view_factors, and
-# density_contributions. Omitting fields writes all four groups.
+# Available field groups are number_density, velocity, temperature,
+# view_factors, and density_contributions. Omitting fields writes all five.
 fields = [
   "number_density",
   "velocity",
+  "temperature",
   "view_factors",
   "density_contributions",
 ]

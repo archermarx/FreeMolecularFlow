@@ -29,6 +29,7 @@ struct PreparedSolver
     exchange_closure_error::Float64
     solid_angles::Matrix{Float64}
     direction_moments::Array{Float64,3}
+    second_direction_moments::Array{Float64,3}
     radiosity_system::RadiositySystem
     field_cache::FieldAssemblyCache
     azimuthal_divisions::Int
@@ -49,9 +50,10 @@ Results of a steady free-molecular calculation.
 
 All spatial arrays are cell-centered. Per-label dictionaries separate direct
 geometric visibility from the actual density contribution after diffuse-wall
-recycling. The saved direct evaluator allows extraction lines to reuse the
-surface BVH without retaining the larger parameter-sweep moment cache in every
-result.
+recycling. `temperature` contains the centered diagonal second moments in
+kelvin, ordered `(T_z,T_r,T_θ)`; it does not imply a Maxwellian VDF. The saved
+direct evaluator allows extraction lines to reuse the surface BVH without
+retaining the larger parameter-sweep moment cache in every result.
 """
 struct FlowResult
     mesh::RZMesh
@@ -60,6 +62,7 @@ struct FlowResult
     density_contributions::Dict{String,Vector{Float64}}
     density::Vector{Float64}
     velocity::Matrix{Float64}       # 3 × ncells, ordered (z,r,azimuthal)
+    temperature::Matrix{Float64}    # 3 × ncells [K], centered (z,r,azimuthal)
     boundary_flux::Vector{Float64}  # particles m^-2 s^-1
     radiosity_residual::Float64
     particle_balance_residual::Float64
@@ -78,6 +81,7 @@ struct GeometricTransport
     exchange_closure_error::Float64
     solid_angles::Matrix{Float64}
     direction_moments::Array{Float64,3}
+    second_direction_moments::Array{Float64,3}
 end
 
 number_density(result::FlowResult) = result.density
@@ -190,6 +194,10 @@ function _geometric_field_moments(mesh::RZMesh,sample_points,patches,bvh,tol;
     # Axisymmetry makes the azimuthal moment exactly zero. Cache only axial and
     # radial components, reducing persistent sweep storage by one quarter.
     direction_moments = zeros(2,segment_count,count)
+    # Diagonal of ∫ ŝ ŝᵀ dΩ, ordered (z,r,azimuthal). Axisymmetry eliminates
+    # the azimuthal cross moments; the diagonal determines directional
+    # temperatures without assuming that the local VDF is Maxwellian.
+    second_direction_moments = zeros(3,segment_count,count)
     patch_indices,quadrature_weight = _field_patch_quadrature(patches,ntheta)
     # Each worker owns a traversal stack. Reusing it makes `_occluded`
     # allocation-free while avoiding synchronization inside BVH traversal.
@@ -212,7 +220,7 @@ function _geometric_field_moments(mesh::RZMesh,sample_points,patches,bvh,tol;
             _dot(patch.normal,ray) > 0 || continue
             _occluded(bvh,patch.surface_center,point,ip,0,tol,
                       traversal_stack) && continue
-            omega,vector_omega = _solid_angle_moments(point,patch)
+            omega,vector_omega,second_omega = _solid_angle_moments(point,patch)
             scale = quadrature_weight*patch.area_scale
             omega *= scale
             omega > 0 || continue
@@ -224,13 +232,17 @@ function _geometric_field_moments(mesh::RZMesh,sample_points,patches,bvh,tol;
             vector_omega = _vscale(vector_omega,-scale)
             direction_moments[1,iseg,ic] += vector_omega[1]
             direction_moments[2,iseg,ic] += vector_omega[2]
+            for component in 1:3
+                second_direction_moments[component,iseg,ic] +=
+                    scale*second_omega[component]
+            end
         end
         _thread_status!(reporter,reporter_lock,completed,phase,count;
                         exchange_closure=closure,radiosity=radiosity)
     end
     _status!(reporter,phase,count;total=count,exchange_closure=closure,
              radiosity=radiosity,force=true)
-    solid_angles,direction_moments
+    solid_angles,direction_moments,second_direction_moments
 end
 
 function _field_assembly_cache(mesh::RZMesh,solid_angles)
@@ -247,17 +259,23 @@ function _field_assembly_cache(mesh::RZMesh,solid_angles)
     FieldAssemblyCache(labels,segment_label,direct,_label_areas(mesh))
 end
 
-function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas,
+function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,
+                          second_direction_moments,q,gas,
                           cache=_field_assembly_cache(mesh,solid_angles))
     labels = cache.labels
     count = size(solid_angles,2)
     contribution_values = zeros(length(labels),count)
     momentum = zeros(3,count)
+    raw_second_moment = zeros(3,count)
+    temperature = zeros(3,count)
     density = zeros(count)
     speeds = [mean_molecular_speed(gas,_temperature(s.condition))
               for s in mesh.boundary_segments]
     density_weights = q ./ (pi .* speeds)
     momentum_weights = q ./ pi
+    second_moment_weights = density_weights .* [
+        3BOLTZMANN*_temperature(s.condition)/gas.molecular_mass
+        for s in mesh.boundary_segments]
     for ic in 1:count, iseg in eachindex(mesh.boundary_segments)
         omega = solid_angles[iseg,ic]
         omega > 0 || continue
@@ -269,11 +287,23 @@ function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas,
         density[ic] += dn
         momentum[1,ic] += momentum_weights[iseg]*direction_moments[1,iseg,ic]
         momentum[2,ic] += momentum_weights[iseg]*direction_moments[2,iseg,ic]
+        for component in 1:3
+            raw_second_moment[component,ic] += second_moment_weights[iseg] *
+                second_direction_moments[component,iseg,ic]
+        end
     end
     for ic in 1:count
         if density[ic] > 100eps(Float64)
             momentum[1,ic] /= density[ic]
             momentum[2,ic] /= density[ic]
+            for component in 1:3
+                variance = raw_second_moment[component,ic]/density[ic] -
+                           momentum[component,ic]^2
+                # The analytic moments make the covariance nonnegative. Clamp
+                # only the possible negative zero from floating-point roundoff.
+                temperature[component,ic] =
+                    gas.molecular_mass/BOLTZMANN * max(variance,0.0)
+            end
         else
             momentum[1,ic] = 0.0
             momentum[2,ic] = 0.0
@@ -287,16 +317,17 @@ function _assemble_fields(mesh::RZMesh,solid_angles,direction_moments,q,gas,
     # cached geometry by modifying a previous FlowResult.
     direct = Dict(label=>copy(values)
                   for (label,values) in cache.direct_view_factors)
-    copy(labels),direct,contribution,density,momentum
+    copy(labels),direct,contribution,density,momentum,temperature
 end
 
 function _evaluate_fields(mesh::RZMesh,sample_points,patches,bvh,q,gas,tol;
                           ntheta::Int=1,reporter=nothing,closure=NaN,
                           radiosity=NaN,phase=:field_reconstruction)
-    solid_angles,direction_moments = _geometric_field_moments(
+    solid_angles,direction_moments,second_direction_moments = _geometric_field_moments(
         mesh,sample_points,patches,bvh,tol;
         ntheta,reporter,closure,radiosity,phase)
-    _assemble_fields(mesh,solid_angles,direction_moments,q,gas)
+    _assemble_fields(mesh,solid_angles,direction_moments,
+                     second_direction_moments,q,gas)
 end
 
 function _particle_balance(mesh,H,q)
@@ -324,10 +355,11 @@ function _geometric_transport(geometry,mesh,nazimuth,tol,reporter)
              total=length(patches),force=true)
     H,closure = _boundary_exchange(
         mesh,patches,occluder,tol,nazimuth,reporter)
-    solid_angles,direction_moments = _geometric_field_moments(
+    solid_angles,direction_moments,second_direction_moments = _geometric_field_moments(
         mesh,mesh.centers,patches,occluder,tol;
         ntheta=nazimuth,reporter,closure,phase=:field_precompute)
-    GeometricTransport(patches,occluder,H,closure,solid_angles,direction_moments)
+    GeometricTransport(patches,occluder,H,closure,solid_angles,direction_moments,
+                       second_direction_moments)
 end
 
 function _relative_change(current,previous)
@@ -343,7 +375,9 @@ end
 function _transport_change(current::GeometricTransport,previous::GeometricTransport)
     max(_relative_change(current.exchange_matrix,previous.exchange_matrix),
         _relative_change(current.solid_angles,previous.solid_angles),
-        _relative_change(current.direction_moments,previous.direction_moments))
+        _relative_change(current.direction_moments,previous.direction_moments),
+        _relative_change(current.second_direction_moments,
+                         previous.second_direction_moments))
 end
 
 function _converged_transport(geometry,mesh,options,tol,reporter)
@@ -392,11 +426,13 @@ function prepare(geometry::AxisymmetricGeometry,boundaries;
     H,closure = transport.exchange_matrix,transport.exchange_closure_error
     solid_angles = transport.solid_angles
     direction_moments = transport.direction_moments
+    second_direction_moments = transport.second_direction_moments
     radiosity_system = _prepare_radiosity_system(
         mesh,H,options.radiosity_tolerance)
     field_cache = _field_assembly_cache(mesh,solid_angles)
     PreparedSolver(geometry,mesh,transport.patches,transport.occluder,H,closure,solid_angles,
-                   direction_moments,radiosity_system,field_cache,nazimuth,
+                   direction_moments,second_direction_moments,
+                   radiosity_system,field_cache,nazimuth,
                    azimuthal_error,tol,options)
 end
 
@@ -424,13 +460,14 @@ function _solve_prepared(prepared::PreparedSolver,mesh::RZMesh,gas::Gas,reporter
         prepared.field_cache.label_areas)
     _status!(reporter,:radiosity,1;total=1,exchange_closure=closure,
              radiosity=residual,force=true)
-    labels,direct,contributions,density,velocity = _assemble_fields(
-        mesh,prepared.solid_angles,prepared.direction_moments,q,gas,
+    labels,direct,contributions,density,velocity,temperature = _assemble_fields(
+        mesh,prepared.solid_angles,prepared.direction_moments,
+        prepared.second_direction_moments,q,gas,
         prepared.field_cache)
     balance = _particle_balance(mesh,H,q)
     _status!(reporter,:complete,1;total=1,exchange_closure=closure,
              radiosity=residual,particle_balance=balance,force=true)
-    FlowResult(mesh,labels,direct,contributions,density,velocity,q,
+    FlowResult(mesh,labels,direct,contributions,density,velocity,temperature,q,
                residual,balance,closure,prepared.azimuthal_divisions,
                prepared.azimuthal_convergence_error,gas,options,
                DirectEvaluator(prepared.patches,prepared.occluder,

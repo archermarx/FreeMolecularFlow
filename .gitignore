@@ -4,3 +4,4 @@
 coverage/
 *.fmf-cache
 *.csv
+.DS_Store

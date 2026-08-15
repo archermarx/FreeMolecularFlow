@@ -114,7 +114,7 @@ Base.@kwdef struct SolverOptions
     max_mesh_points::Int = 200_000      # Guard against runaway mesh refinement.
 end
 
-const EXTRACTION_FIELDS = (:number_density, :velocity, :view_factors,
+const EXTRACTION_FIELDS = (:number_density, :velocity, :temperature, :view_factors,
                            :density_contributions)
 
 function _extraction_choice(value, name, allowed)

@@ -56,6 +56,8 @@ end
     @test all(isfinite,result.density)
     @test maximum(abs.(result.density ./ exact_density .- 1)) < 0.08
     @test maximum(abs.(result.velocity)) / mean_molecular_speed(XENON,temperature) < 0.03
+    @test size(result.temperature) == (3,length(result.density))
+    @test maximum(abs.(result.temperature ./ temperature .- 1)) < 0.03
     @test result.particle_balance_residual < 1e-9
     @test result.exchange_closure_error < 1e-9
     @test maximum(abs.(result.direct_view_factors["reservoir"] .- 1)) < 0.08
@@ -84,6 +86,19 @@ end
     @test a.particle_balance_residual < 1e-9
     @test all(a.density .> 0)
     @test b.density ≈ 2 .* a.density rtol=2e-12
+    @test b.temperature ≈ a.temperature rtol=5e-14 atol=1e-12
+    @test all(isfinite,a.temperature)
+    @test all(a.temperature .>= 0)
+    source_temperatures = Dict(
+        s.label => getproperty(s.condition,:temperature)
+        for s in a.mesh.boundary_segments)
+    density_temperature = sum(
+        a.density_contributions[label] .* source_temperatures[label]
+        for label in a.labels)
+    expected_scalar_temperature = density_temperature ./ a.density .-
+        XENON.molecular_mass .* vec(sum(abs2,a.velocity;dims=1)) ./ (3KB)
+    @test vec(sum(a.temperature;dims=1)) ./ 3 ≈
+          expected_scalar_temperature rtol=5e-14 atol=1e-12
     summed = reduce(+,values(a.density_contributions))
     @test summed ≈ a.density rtol=5e-15
 end
@@ -94,6 +109,7 @@ end
                       "reservoir"=>BackPressure(0.01,300.0))
     prepared = prepare(geometry,boundaries;options=QUICK)
     @test size(prepared.direction_moments,1) == 2
+    @test size(prepared.second_direction_moments,1) == 3
     base = solve(prepared,XENON)
     @test base.labels == prepared.field_cache.labels
     @test base.direct_view_factors == prepared.field_cache.direct_view_factors
@@ -104,6 +120,7 @@ end
     @test doubled.evaluator.patches === prepared.patches
     @test doubled.density ≈ 2 .* base.density rtol=5e-14
     @test doubled.velocity ≈ base.velocity rtol=5e-14 atol=1e-12
+    @test doubled.temperature ≈ base.temperature rtol=5e-14 atol=1e-12
     @test_throws ArgumentError solve(prepared,
         Dict("axis"=>Axis()),XENON)
 
@@ -144,9 +161,21 @@ end
     # moment cannot be larger than the scalar solid angle.
     point = (mesh.centers[1][1],mesh.centers[1][2],0.0)
     patch = patches[first(indices)]
-    omega,vector_omega = FreeMolecularFlow._solid_angle_moments(point,patch)
+    omega,vector_omega,second_omega =
+        FreeMolecularFlow._solid_angle_moments(point,patch)
     @test omega ≈ FreeMolecularFlow._solid_angle(point,patch) rtol=2e-15
     @test FreeMolecularFlow._norm(vector_omega) <= omega
+    @test sum(second_omega) ≈ omega rtol=2e-15
+    @test all(x -> 0 <= x <= omega,second_omega)
+
+    # An octant of the unit sphere has equal diagonal second moments Ω/3.
+    octant = FreeMolecularFlow.SurfacePatch(
+        (1.0,0.0,0.0),(-1.0,1.0,0.0),(-1.0,0.0,1.0),
+        (1/3,1/3,1/3),(1/3,1/3,1/3),(1.0,1.0,1.0),1.0,1.0,1)
+    octant_omega,_,octant_second = FreeMolecularFlow._solid_angle_moments(
+        (0.0,0.0,0.0),octant)
+    @test octant_omega ≈ pi/2
+    @test all(octant_second .≈ pi/6)
 
     # Half-ring integration should agree with explicitly summing both members
     # of every mirrored pair. Passing an odd marker selects the full-ring path.
@@ -159,6 +188,7 @@ end
     @test half[1] == full[1]
     @test half[4] ≈ full[4] rtol=2e-14
     @test half[5] ≈ full[5] rtol=2e-14 atol=1e-12
+    @test half[6] ≈ full[6] rtol=2e-14 atol=1e-12
     for label in half[1]
         @test half[2][label] ≈ full[2][label] rtol=2e-14
         @test half[3][label] ≈ full[3][label] rtol=2e-14
@@ -254,18 +284,20 @@ end
         xml = read(path,String)
         @test occursin("number_density",xml)
         @test occursin("velocity",xml)
+        @test occursin("Name=\"temperature\" NumberOfComponents=\"3\"",xml)
         @test occursin("direct_view_factor_reservoir",xml)
         @test occursin("density_from_reservoir",xml)
         @test occursin("azimuthal_divisions",xml)
 
         line = ExtractionLine("crossing",
             [(-0.01,0.025),(0.11,0.025)];num_points=5,method=:cell,
-            outside_domain=:keep,fields=[:number_density,:velocity],
+            outside_domain=:keep,fields=[:number_density,:velocity,:temperature],
             filename="line.csv")
         csv_path = write_extraction_line(joinpath(dir,line.filename),result,line)
         rows = readlines(csv_path)
         @test length(rows) == 6
         @test startswith(rows[1],"sample,path_segment,fraction,distance,z,r,inside_domain,cell_index,number_density")
+        @test occursin("temperature_z,temperature_r,temperature_theta",rows[1])
         @test split(rows[2],',')[7:8] == ["false","0"]
         @test split(rows[4],',')[7] == "true"
         @test split(rows[6],',')[7:8] == ["false","0"]

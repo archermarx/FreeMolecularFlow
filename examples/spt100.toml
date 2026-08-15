@@ -8,26 +8,18 @@ molecular_mass_amu = 131.293
 # and outer body extend to r=0.080 m; the background domain ends at z=r=0.1 m.
 points = [
   [0.000, 0.035],
-  [0.000, 0.04],
-  [0.000, 0.045],
   [0.000, 0.050],
   [0.025, 0.050],
   [0.025, 0.080],
-  [0.000, 0.080],
-  [0.000, 0.100],
-  [0.100, 0.100],
+  [0.100, 0.080],
   [0.100, 0.000],
   [0.025, 0.000],
   [0.025, 0.035],
 ]
 edge_labels = [
-  "wall",
   "anode",
   "wall",
   "wall",
-  "wall",
-  "wall",
-  "background",
   "background",
   "background",
   "axis",
@@ -38,7 +30,7 @@ edge_labels = [
 [boundaries.anode]
 type = "inflow"
 mass_flow_rate = 5.0e-6       # 5 mg/s
-temperature = 1273.15          # 1000 degC
+temperature = 1000.0          # 1000 K
 
 [boundaries.wall]
 type = "diffuse_wall"
@@ -46,7 +38,7 @@ temperature = 773.15          # 500 degC
 
 [boundaries.background]
 type = "back_pressure"
-pressure = 6.6661184e-4       # 5e-6 Torr in Pa
+pressure = 6.6661184e-12       # 5e-6 Torr in Pa
 temperature = 100.0
 
 [boundaries.axis]

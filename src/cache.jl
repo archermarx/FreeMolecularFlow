@@ -1,5 +1,5 @@
 const PREPARED_CACHE_MAGIC = "FreeMolecularFlow.PreparedSolver"
-const PREPARED_CACHE_VERSION = 1
+const PREPARED_CACHE_VERSION = 2
 
 _package_version() = Base.pkgversion(@__MODULE__)
 
